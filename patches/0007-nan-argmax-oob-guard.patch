@@ -1,0 +1,58 @@
+From: deepseek-v4-cmp170hx
+Subject: [PATCH 0007] rejection sampler: map NaN to -inf before tl.argmax
+ (port of vllm-project/vllm@47a4e410b / #50183, which post-dates c3046d1)
+
+The c3046d1 base is 2026-08-04; upstream fixed this on 2026-08-06, so every
+build from this series ships without it.
+
+WHAT BREAKS. An all-NaN (or NaN-max) target logits row makes every per-block
+local max NaN. tl.argmax over such a block returns an index into the PADDED
+region (>= num_blocks), causing an out-of-bounds read of the local-argmax
+tensors in _compute_global_target_argmax (greedy targets) and
+_insert_resampled_kernel (stochastic targets). The OOB read yields an
+arbitrary token id, which is then COMMITTED as sampled output.
+
+WHY YOU CARE ON SM8x + FP8 KV. NaN logits rows are not hypothetical on this
+lineage (the VLLM_SM86_NAN_PROBE knob exists for a reason). On 4x/8x A800
+80GB with fp8 kv-cache and DSpark greedy k=3, we measured tool-calling
+(DSML) corruption at 35-65% per request WITHOUT this guard and 20% WITH it
+on the old pre-c3046d1 tree; the corruption presents as broken DSML
+structural tokens and single-token repetition runs ("0000..." x139), i.e.
+exactly what an occasionally-committed arbitrary token does to structured
+output while remaining invisible in prose. Full write-up:
+https://github.com/allover326/deepseek-v4-cmp170hx/issues/9
+
+On c3046d1 itself (TP=4 + EP, greedy DSpark k=5) we run this guard
+belt-and-suspenders and measure 56/56 clean structured tool calls including
+streaming. The guard is two branchless tl.where lines on already-loaded
+values; no measurable cost.
+
+Applies after 0006 in plain glob order; independent of every other patch in
+the series (touches only vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py,
+which no other patch modifies).
+
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
+@@ -108,6 +108,8 @@
+         mask=blocks_mask,
+         other=float("-inf"),
+     )
++    # vllm#50183: NaN breaks tl.argmax index bounds -> OOB read of local argmax.
++    local_max = tl.where(local_max != local_max, float("-inf"), local_max)
+     max_block_idx = tl.argmax(local_max, axis=0)
+     return tl.load(
+         target_local_argmax_ptr + logit_idx * target_local_argmax_stride + max_block_idx
+@@ -849,6 +851,13 @@
+         mask=mask,
+         other=float("-inf"),
+     )
++    # vllm#50183: NaN max values make tl.argmax return an out-of-range block
++    # index (into the padded region), causing an OOB read. Map NaN to -inf.
++    resampled_local_max = tl.where(
++        resampled_local_max != resampled_local_max,
++        float("-inf"),
++        resampled_local_max,
++    )
+     resampled_max_block_idx = tl.argmax(resampled_local_max, axis=0)
+     resampled = tl.load(
+         resampled_local_argmax_ptr
