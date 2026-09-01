@@ -18,14 +18,29 @@
 # repetition_penalty=1.0) -- set server-side via --override-generation-config so
 # no client-side config is required, matching how this repo's DeepSeek launcher
 # pins top_p (see SETTINGS.md).
+#
+# chat_template_lenient_system.jinja: the stock chat_template.jinja raises
+# jinja2.exceptions.TemplateError('System message must be at the beginning.')
+# for any role=="system" message not at index 0. DeepSeek's tokenizer has no
+# such constraint (handles system/developer roles per-message anywhere), so
+# switching an in-progress opencode session from dsv4 to this model hits it
+# immediately if the accumulated history ever picked up a system-role message
+# past index 0 (a mid-session reminder, a compaction re-injection, etc.) --
+# confirmed live 2026-09-01. The lenient copy (same file, one block changed:
+# see its diff against the stock template) renders a non-first system message
+# as its own inline <|im_start|>system...<|im_end|> turn instead of raising.
+# Model-swap-mid-session keeps working at the cost of not matching Qwen's own
+# strict system-message-placement contract exactly.
 
 IMG="${QWEN_IMAGE:-docker.io/lazymio/vllm-backport:latest-sm80}"
 MODEL="${QWEN_MODEL:-$HOME/models/models/Qwen/Qwen3.8-Flash-Next-FP8}"
 MAXLEN="${QWEN_MAXLEN:-1000000}"
+CHAT_TEMPLATE="${QWEN_CHAT_TEMPLATE:-$MODEL/chat_template_lenient_system.jinja}"
 NAME="qwen3-flash-next"
 
 podman image inspect "$IMG" >/dev/null 2>&1 || { echo "ERROR: image $IMG not pulled"; exit 1; }
 [[ -d "$MODEL" ]] || { echo "ERROR: model dir not found: $MODEL"; exit 1; }
+[[ -f "$CHAT_TEMPLATE" ]] || { echo "ERROR: chat template not found: $CHAT_TEMPLATE"; exit 1; }
 
 # Frees port 8098 -- this and dsv4-a100 are mutually exclusive on this host.
 podman stop -t 60 dsv4-a100 >/dev/null 2>&1
@@ -42,6 +57,7 @@ podman run -d --name "$NAME" --device nvidia.com/gpu=all \
   "$IMG" /model \
   --host 0.0.0.0 --port 8000 \
   --served-model-name qwen3.8-flash-next \
+  --chat-template "/model/$(basename "$CHAT_TEMPLATE")" \
   --tensor-parallel-size 4 --enable-expert-parallel \
   --max-model-len "$MAXLEN" --max-num-seqs 8 --max-num-batched-tokens 2048 \
   --gpu-memory-utilization 0.9 --disable-custom-all-reduce \
