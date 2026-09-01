@@ -69,7 +69,19 @@ COPY patches /tmp/patches
 RUN for p in /tmp/patches/*.patch; do \
         case "$p" in *0001-*) continue ;; esac; \
         echo "applying $(basename "$p")"; \
-        patch -p1 --forward < "$p" || exit 1; \
+        out=$(patch -p1 --forward < "$p" 2>&1); rc=$?; \
+        if [ $rc -ne 0 ]; then \
+            if [ "$(basename "$p")" = "0019-grammar-salvage-and-dspark-desync-guards.patch" ] \
+              && printf '%s\n' "$out" | grep -q 'Reversed (or previously applied)' \
+              && [ "$(printf '%s\n' "$out" | grep -c '^patching file')" -eq 4 ]; then \
+                echo "== 0019: expected backend_xgrammar.py partial-skip (fixup follows), continuing =="; \
+                find . -name '*.rej' -delete; \
+            else \
+                echo "$out" >&2; exit 1; \
+            fi; \
+        else \
+            echo "$out"; \
+        fi; \
     done && \
     rm -rf /tmp/patches && \
     find . -name '*.orig' -delete && find . -name '*.rej' -delete
