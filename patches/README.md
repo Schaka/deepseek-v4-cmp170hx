@@ -37,6 +37,43 @@ On `c3046d1`:
   `_resample_kernel`) to `vocab_size - 1` — an out-of-vocab tile-local argmax otherwise reaches
   DeepSeek-V4's hash-MoE router and faults every rank. Distinct kernels from `0007`'s NaN guard
   (no overlap); applies after `0007` in glob order.
+- **`0009` (new, 2026-09-01)** — DSML orphan-invoke recovery. Port of
+  [vllm-project/vllm#49117](https://github.com/vllm-project/vllm/pull/49117) (open at port
+  time), adapted the same way as `0008`: every touched region diffed byte-for-byte against a
+  pristine c3046d1 checkout, confirmed identical under line-number drift, then renumbered.
+  Fixes [vllm-project/vllm#48931](https://github.com/vllm-project/vllm/issues/48931) — at long
+  context DeepSeek V4/V3.2 sometimes omit the opening `<｜DSML｜tool_calls>` /
+  `<｜DSML｜function_calls>` wrapper while still writing a well-formed `<｜DSML｜invoke ...>`
+  block, and the parser only entered tool mode on the wrapper, so the whole call leaked to the
+  user as raw text. Adds a recovery transition that starts a tool call directly from a bare
+  invoke marker, a `FOREIGN_BLOCK` state so the V4 and V3.2 parsers don't misparse each other's
+  wrapper, and a name-validation hold so prose that merely quotes the marker isn't misparsed as
+  a call. Touches `vllm/parser/deepseek_v32.py`, `vllm/parser/deepseek_v4.py`,
+  `vllm/parser/engine/parser_engine.py`, `vllm/parser/engine/parser_engine_config.py`,
+  `vllm/parser/engine/streaming_parser_engine.py`, `vllm/tool_parsers/utils.py` — none of which
+  0001-0008 touch. Applies after `0008` in glob order.
+- **`0010`-`0015` (new, 2026-09-01)** — six-patch hardening series on top of `0009`'s recovery
+  path, from [rasatpetabit's gist](https://gist.github.com/rasatpetabit/c66923a17305f04b2544f952ab8f50cb)
+  (original commits by Richard A Steenbergen). Applied with **zero fuzz/offset** on top of the
+  adapted `0009` tree — confirms the gist was authored directly against that same PR #49117
+  baseline. In order:
+  - `0010` — suppress recovery (and don't consume DSML markup as control flow) when the request
+    declares no tools at all, not just `tool_choice: "none"`; the old check missed the no-tools
+    case entirely and could empty out a completion that merely quoted DSML syntax.
+  - `0011` — a recovered call must **close** (`TOOL_CALL_END`) before it commits, not just pass
+    name validation — closes a misparse where prose like `write <｜DSML｜invoke name="terminal">
+    and close the block` invented a call from the sentence.
+  - `0012` — a recovered call must also carry its tool's **required arguments**; prose that
+    happens to close a quoted marker still shouldn't commit if the payload isn't the tool's
+    schema.
+  - `0013` — fixes `0012`'s argument gate failing open (accepting everything) for configs with
+    no `arg_converter` (kimi_k2/mistral-style, whose raw arg chunks are already JSON).
+  - `0014` — `collect_required_tool_params` no longer raises `TypeError` on a malformed
+    `"required"` schema field (`null`, a bare string, mixed-type lists).
+  - `0015` — catches `RecursionError` from adversarially deep argument JSON in the gate, and
+    tightens `"required"` parsing to accept only a list of strings, all-or-nothing.
+  Each patch found by the prior one's own adversarial review round (per patch, see its header);
+  applies after `0009` in glob order.
 - ⚠️ **The range touches `csrc/`** (`libtorch_stable/topk.cu` FilteredTopK decode routing —
   one of the real wins — plus `marlin.cu`, `custom_all_reduce.cuh`), so
   `VLLM_USE_PRECOMPILED=1` and the bind-mount method **cannot deliver the kernel changes**.

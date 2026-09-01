@@ -1,0 +1,43 @@
+From: deepseek-v4-cmp170hx
+Subject: [PATCH 0015] parser: harden the no-converter gate against hostile schemas and args
+ (port of rasatpetabit's DSML orphan-invoke hardening series,
+ patch 6/6, adapted to the c3046d1 base; original commit by
+ Richard A Steenbergen <ras@petabitscale.com>)
+
+
+Review round 3: catch RecursionError from deeply nested argument JSON
+(reject, do not abort the request); trust "required" only when it is
+entirely a list of strings, per this helper's stated all-or-nothing
+contract.
+
+Original source: https://gist.github.com/rasatpetabit/c66923a17305f04b2544f952ab8f50cb
+(0006-parser-harden-the-no-converter-gate-against-hostile-.patch in that series; hardens the orphan-invoke recovery
+path added by 0009/vllm-project/vllm#49117.)
+
+--- a/vllm/parser/engine/streaming_parser_engine.py
++++ b/vllm/parser/engine/streaming_parser_engine.py
+@@ -591,7 +591,7 @@ class StreamingParserEngine:
+                 converter(raw_args, False) if converter is not None
+                 else raw_args
+             )
+-        except (TypeError, ValueError):
++        except (TypeError, ValueError, RecursionError):
+             return False
+         return isinstance(provided, dict) and needed <= provided.keys()
+ 
+--- a/vllm/tool_parsers/utils.py
++++ b/vllm/tool_parsers/utils.py
+@@ -337,9 +337,11 @@ def _required_param_names(params: dict | None) -> frozenset[str]:
+     checkable requirements.
+     """
+     needed = (params or {}).get("required")
+-    if not isinstance(needed, (list, tuple, set, frozenset)):
++    if not isinstance(needed, list):
+         return frozenset()
+-    return frozenset(n for n in needed if isinstance(n, str))
++    if not all(isinstance(n, str) for n in needed):
++        return frozenset()
++    return frozenset(needed)
+ 
+ 
+ def find_tool_name(

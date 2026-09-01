@@ -203,7 +203,7 @@ driven gains you nothing and risks damaging the contact.
 ## Repo layout
 
 ```
-patches/     9 patches against haosdent/vllm@dsv4-flash-a100 (f8ea5bb) — see patches/README.md
+patches/     16 patches against haosdent/vllm@dsv4-flash-a100 (f8ea5bb) — see patches/README.md
 docker/      container build (CUDA-devel base + venv, precompiled vLLM wheel)
 launch/      run-pp-dspark.sh (best config) and run-a100.sh (tensor-parallel variant)
 bench/       the 8 harnesses every number in RESULTS.md came from

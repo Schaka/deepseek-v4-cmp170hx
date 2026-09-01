@@ -1,0 +1,51 @@
+From: deepseek-v4-cmp170hx
+Subject: [PATCH 0014] parser: tolerate malformed "required" in tool schemas
+ (port of rasatpetabit's DSML orphan-invoke hardening series,
+ patch 5/6, adapted to the c3046d1 base; original commit by
+ Richard A Steenbergen <ras@petabitscale.com>)
+
+
+collect_required_tool_params raised TypeError on "required": null and
+silently split a string into characters. Only a list of names is a
+checkable requirement; anything else means no requirements to enforce.
+
+Found by adversarial review round 2; regression test
+required_null_test.py (confirmed end-to-end crash on the prior series).
+
+Original source: https://gist.github.com/rasatpetabit/c66923a17305f04b2544f952ab8f50cb
+(0005-parser-tolerate-malformed-required-in-tool-schemas.patch in that series; hardens the orphan-invoke recovery
+path added by 0009/vllm-project/vllm#49117.)
+
+--- a/vllm/tool_parsers/utils.py
++++ b/vllm/tool_parsers/utils.py
+@@ -320,15 +320,28 @@ def collect_required_tool_params(
+     for tool in tools:
+         if isinstance(tool, (FunctionTool, NamespaceTool)):
+             for name, params in iter_response_function_tool_info(tool):
+-                required[name] = frozenset((params or {}).get("required", ()))
++                required[name] = _required_param_names(params)
+             continue
+         if not _is_function_tool(tool):
+             continue
+         name, params = _extract_tool_info(tool)
+-        required[name] = frozenset((params or {}).get("required", ()))
++        required[name] = _required_param_names(params)
+     return required
+ 
+ 
++def _required_param_names(params: dict | None) -> frozenset[str]:
++    """A schema's "required" is only trusted when it is a list of names.
++
++    Request models accept arbitrary schema dictionaries, so "required" may
++    be null, a string, or garbage; anything but a list of strings means no
++    checkable requirements.
++    """
++    needed = (params or {}).get("required")
++    if not isinstance(needed, (list, tuple, set, frozenset)):
++        return frozenset()
++    return frozenset(n for n in needed if isinstance(n, str))
++
++
+ def find_tool_name(
+     tools: list[Tool] | None,
+     tool_name: str,

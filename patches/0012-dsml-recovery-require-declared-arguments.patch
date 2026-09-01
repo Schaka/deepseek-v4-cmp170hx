@@ -1,0 +1,169 @@
+From: deepseek-v4-cmp170hx
+Subject: [PATCH 0012] parser: a recovered tool call must carry the arguments its tool requires
+ (port of rasatpetabit's DSML orphan-invoke hardening series,
+ patch 3/6, adapted to the c3046d1 base; original commit by
+ Richard A Steenbergen <ras@petabitscale.com>)
+
+
+Holding a recovered orphan invoke until it closes is necessary but not
+sufficient.  Prose explaining how to close a block emits the closing
+marker too, so the hold resolves and a phantom call commits, swallowing
+the sentence as arguments and returning empty ones.
+
+The invoke marker is ordinary text, so the markup cannot separate a real
+call from prose quoting one.  The payload can: a genuine call supplies
+the parameters the tool declares as required, prose supplies a sentence.
+Gate the commit on that, and re-emit the held span as content otherwise.
+
+Only recovered calls are affected -- a properly wrapped call never
+consults the gate.  A tool that requires nothing stays ambiguous by
+construction; that case is pinned in the tests as known, not fixed.
+
+Original source: https://gist.github.com/rasatpetabit/c66923a17305f04b2544f952ab8f50cb
+(0003-parser-a-recovered-tool-call-must-carry-the-argument.patch in that series; hardens the orphan-invoke recovery
+path added by 0009/vllm-project/vllm#49117.)
+
+--- a/vllm/parser/engine/parser_engine.py
++++ b/vllm/parser/engine/parser_engine.py
+@@ -29,6 +29,7 @@ from vllm.parser.engine.parser_engine_config import ParserEngineConfig, ParserSt
+ from vllm.parser.engine.streaming_parser_engine import StreamingParserEngine
+ from vllm.tool_parsers.utils import (
+     coerce_to_schema_type,
++    collect_required_tool_params,
+     collect_tool_names,
+     extract_types_from_schema,
+     find_tool_name,
+@@ -416,12 +417,16 @@ class ParserEngine(Parser):
+         if tools:
+             self._tools = tools
+             self._engine.allowed_tool_names = self._declared_tool_names()
++            self._engine.required_tool_params = collect_required_tool_params(
++                tools
++            )
+         else:
+             # The engine is reused across requests and reset() keeps this
+             # field, so it has to be cleared here.  Otherwise a request
+             # that declares no tools would inherit the names of the
+             # previous one and could recover a tool it never asked for.
+             self._engine.allowed_tool_names = None
++            self._engine.required_tool_params = None
+         # Derived fresh for every request.  The engine is reused across
+         # requests, so latching this would let one request's suppression
+         # leak into every later one.  A request that declares no tools at
+--- a/vllm/parser/engine/streaming_parser_engine.py
++++ b/vllm/parser/engine/streaming_parser_engine.py
+@@ -5,6 +5,7 @@ incremental lexing, and state-machine-driven semantic event emission."""
+ 
+ from __future__ import annotations
+ 
++import json
+ from collections.abc import Sequence
+ from dataclasses import dataclass
+ 
+@@ -170,6 +171,11 @@ class StreamingParserEngine:
+         # Set per request by the owning ParserEngine; survives reset()
+         # like ``skip_tool_parsing``.
+         self.suppress_tool_calls = False
++        # Required parameter names per declared tool, or None when unknown.
++        # Consulted only when deciding whether to commit a *recovered*
++        # tool call.  Set per request by the owning ParserEngine alongside
++        # ``allowed_tool_names``; survives reset() the same way.
++        self.required_tool_params: dict[str, frozenset[str]] | None = None
+         self.reset(initial_state=initial_state)
+ 
+     def _reset_args_state(self) -> None:
+@@ -524,8 +530,13 @@ class StreamingParserEngine:
+         that was recovered without its opening wrapper: ordinary prose
+         quoting an invoke marker carries a real tool name too.  Such a
+         block is only real if it actually closes, so the hold continues
+-        through the body until a TOOL_CALL_END arrives.  Prose never
+-        produces one, and ``finish`` releases the held text as content.
++        through the body until a TOOL_CALL_END arrives; ``finish``
++        releases the held text as content when none ever does.
++
++        Closing is necessary but not sufficient — prose explaining how to
++        close a block writes the closing marker too — so a recovered call
++        must also carry the arguments its tool requires.  See
++        ``_recovered_call_is_usable``.
+         """
+         if self._hold_phase == "name":
+             name = "".join(self._held_name)
+@@ -541,11 +552,46 @@ class StreamingParserEngine:
+         events = self._run_transition(transition, value)
+         self._held_events.extend(events)
+         if any(e.type is EventType.TOOL_CALL_END for e in events):
++            if not self._recovered_call_is_usable():
++                return self._abort_hold("".join(self._held_raw))
+             held = self._held_events
+             self._clear_hold()
+             return held
+         return []
+ 
++    def _recovered_call_is_usable(self) -> bool:
++        """Whether a held, recovered call carries the arguments it needs.
++
++        A recovered call is a guess: the invoke marker is ordinary text,
++        so prose quoting a declared tool is indistinguishable from a real
++        invoke at the token level.  What does separate them is the
++        payload — a genuine call supplies the tool's required parameters,
++        prose supplies a sentence.  Rejecting here re-emits the whole held
++        span as content, which is what the text was to begin with.
++
++        A tool that requires nothing stays ambiguous by construction and
++        is accepted, as is the case where the request's schema is unknown.
++        """
++        required = self.required_tool_params
++        if not required:
++            return True
++        needed = required.get("".join(self._held_name))
++        if not needed:
++            return True
++        converter = self.config.arg_converter
++        if converter is None:
++            return True
++        raw_args = "".join(
++            e.value
++            for e in self._held_events
++            if e.type is EventType.ARG_VALUE_CHUNK
++        )
++        try:
++            provided = json.loads(converter(raw_args, False))
++        except (TypeError, ValueError):
++            return False
++        return isinstance(provided, dict) and needed <= provided.keys()
++
+     def _abort_hold(self, raw: str) -> list[SemanticEvent]:
+         """Discard held events and re-emit the raw text as content."""
+         self.state = self._held_prior_state
+--- a/vllm/tool_parsers/utils.py
++++ b/vllm/tool_parsers/utils.py
+@@ -306,6 +306,29 @@ def collect_tool_names(tools: list[Tool] | None) -> frozenset[str]:
+     return frozenset(names)
+ 
+ 
++def collect_required_tool_params(
++    tools: list[Tool] | None,
++) -> dict[str, frozenset[str]]:
++    """Map each declared function tool to its required parameter names.
++
++    Tools that require nothing are still present, mapped to an empty set,
++    so callers can tell "declares no requirements" from "not declared".
++    """
++    if not tools:
++        return {}
++    required: dict[str, frozenset[str]] = {}
++    for tool in tools:
++        if isinstance(tool, (FunctionTool, NamespaceTool)):
++            for name, params in iter_response_function_tool_info(tool):
++                required[name] = frozenset((params or {}).get("required", ()))
++            continue
++        if not _is_function_tool(tool):
++            continue
++        name, params = _extract_tool_info(tool)
++        required[name] = frozenset((params or {}).get("required", ()))
++    return required
++
++
+ def find_tool_name(
+     tools: list[Tool] | None,
+     tool_name: str,

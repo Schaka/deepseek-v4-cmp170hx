@@ -1,0 +1,123 @@
+From: deepseek-v4-cmp170hx
+Subject: [PATCH 0010] parser: do not consume DSML markup a request can never turn into a tool call
+ (port of rasatpetabit's DSML orphan-invoke hardening series,
+ patch 1/6, adapted to the c3046d1 base; original commit by
+ Richard A Steenbergen <ras@petabitscale.com>)
+
+
+A request that declares no tools still entered tool parsing: only
+tool_choice="none" *with* tools set suppress_tool_calls, so
+(CONTENT, "TOOL_START") fired, the machine entered TOOL_PREAMBLE -- which
+has no content_events entry -- and every later chunk was discarded. With no
+complete invoke, no tool_calls were emitted either, so the completion came
+back empty with finish_reason "stop" and no error. Any output that merely
+quotes DSML syntax could destroy itself.
+
+Derive suppression per request and include the no-tools case; the flag was
+also latched (set once in __init__, guarded by "if not
+self._suppress_tool_calls"), which would disable tool calling for the life
+of a reused instance. Treat tool terminals as ordinary text for the current
+state while suppressed, and only end reasoning at TOOL_START when a tool
+call is actually possible -- otherwise DSML quoted inside <think> truncated
+the reasoning and flushed the remaining thoughts into the content.
+
+extract_reasoning was the one entry point that ignored its request and never
+called _check_skip_tool_parsing, so the reasoning path never learned whether
+tools were declared.
+
+Verified by /srv/vllm-patches-tests/parser_conformance_test.py (9 checks,
+CPU-only): genuine tool calls, tool_choice="none", and reasoning that ends
+at a real tool call all still behave correctly.
+
+Known gap: extract_reasoning_streaming takes no request, so suppression
+cannot be derived on the streaming reasoning path.
+
+Original source: https://gist.github.com/rasatpetabit/c66923a17305f04b2544f952ab8f50cb
+(0001-parser-do-not-consume-DSML-markup-a-request-can-neve.patch in that series; hardens the orphan-invoke recovery
+path added by 0009/vllm-project/vllm#49117.)
+
+--- a/vllm/parser/engine/parser_engine.py
++++ b/vllm/parser/engine/parser_engine.py
+@@ -422,13 +422,15 @@ class ParserEngine(Parser):
+             # that declares no tools would inherit the names of the
+             # previous one and could recover a tool it never asked for.
+             self._engine.allowed_tool_names = None
+-        if not self.skip_tool_parsing and not self._suppress_tool_calls:
+-            tool_choice = getattr(request, "tool_choice", None)
+-            if tool_choice == "none" and tools:
+-                self._suppress_tool_calls = True
+-        # The engine needs the suppression state too: recovery
+-        # transitions must not consume text that will never be allowed
+-        # to become a tool call.
++        # Derived fresh for every request.  The engine is reused across
++        # requests, so latching this would let one request's suppression
++        # leak into every later one.  A request that declares no tools at
++        # all cannot produce a tool call either, so it suppresses too.
++        tool_choice = getattr(request, "tool_choice", None)
++        self._suppress_tool_calls = not tools or tool_choice == "none"
++        # The engine needs the suppression state too: tool transitions
++        # must not consume text that will never be allowed to become a
++        # tool call.
+         self._engine.suppress_tool_calls = self._suppress_tool_calls
+ 
+     def _strip_content_whitespace(
+@@ -513,6 +515,10 @@ class ParserEngine(Parser):
+         model_output: str,
+         request: ChatCompletionRequest | ResponsesRequest,
+     ) -> tuple[str | None, str | None]:
++        # Like every other entry point: whether this request can produce a
++        # tool call decides whether tool markup is control flow or just
++        # text the model wrote inside its reasoning.
++        self._check_skip_tool_parsing(request)
+         self._reset()
+         events = self._feed(model_output, [])
+         events.extend(self._engine.finish())
+--- a/vllm/parser/engine/streaming_parser_engine.py
++++ b/vllm/parser/engine/streaming_parser_engine.py
+@@ -163,11 +163,12 @@ class StreamingParserEngine:
+         # set per request by the owning ParserEngine, like
+         # ``skip_tool_parsing`` it survives reset().
+         self.allowed_tool_names: frozenset[str] | None = None
+-        # True when the request asked for tool_choice "none".  Recovery
+-        # transitions are skipped while set, so text that looks like a
+-        # recovered tool call stays plain content instead of being
+-        # consumed and then suppressed.  Set per request by the owning
+-        # ParserEngine; survives reset() like ``skip_tool_parsing``.
++        # True when the request can never yield a tool call: tool_choice
++        # "none", or no tools declared at all.  Tool transitions are
++        # skipped while set, so text that looks like a tool call stays
++        # plain content instead of being consumed and then suppressed.
++        # Set per request by the owning ParserEngine; survives reset()
++        # like ``skip_tool_parsing``.
+         self.suppress_tool_calls = False
+         self.reset(initial_state=initial_state)
+ 
+@@ -352,7 +353,9 @@ class StreamingParserEngine:
+                 return events
+             return self._emit_for_state(value)
+ 
+-        if self.skip_tool_parsing and terminal in self._tool_terminals:
++        if (
++            self.skip_tool_parsing or self.suppress_tool_calls
++        ) and terminal in self._tool_terminals:
+             if self.state == ParserState.MESSAGE_HEADER:
+                 self.state = ParserState.CONTENT
+                 self._message_header_buffer = ""
+@@ -363,7 +366,16 @@ class StreamingParserEngine:
+                         tool_index=self.tool_index,
+                     )
+                 ]
+-            if EventType.REASONING_END in transition.events:
++            # Reasoning ends here only when a tool call is actually
++            # possible — the terminal then marks the real end of thinking.
++            # When the request can never yield one the terminal is just
++            # text the model wrote, often while narrating DSML syntax
++            # inside <think>, so reasoning has to continue.  Ending it
++            # would flush the rest of the thoughts into the content.
++            if (
++                not self.suppress_tool_calls
++                and EventType.REASONING_END in transition.events
++            ):
+                 self.state = ParserState.CONTENT
+                 return [
+                     SemanticEvent(
