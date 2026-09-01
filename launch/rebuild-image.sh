@@ -21,6 +21,15 @@ set -euo pipefail
 FORK_DIR="${FORK_DIR:-$HOME/cmp170hx-deepseek-v4-flash}"
 WORK_DIR="${WORK_DIR:-$HOME/build-12810046c}"
 BASE="12810046c799cbe874967e19b1c0fa134ab7b209"
+# IMAGE_TAG: deliberately distinct from main's "dsv4-a100:devel" -- both
+# rebuild-image.sh scripts used to tag the same name, so whichever branch
+# built LAST silently overwrote the other's image under a name still being
+# actively served from. Caught live on 2026-09-01: this branch's build
+# clobbered main's tag mid-A/B-test while a container built from main was
+# already running (unaffected -- podman pins a running container to the
+# image ID at creation, not the tag -- but the NEXT `podman run` by name
+# would have picked up the wrong branch's image with no warning).
+IMAGE_TAG="${IMAGE_TAG:-dsv4-a100-rebase:devel}"
 
 BASE_DIR="$WORK_DIR/vllm-base"    # pristine tree handed to podman as build context
 CTX_DIR="$WORK_DIR/ctx"           # build context: vllm-base/ + patches/ + Dockerfile
@@ -121,7 +130,7 @@ cp "$FORK_DIR/docker/dockerignore.txt" "$CTX_DIR/.dockerignore"
 
 echo "== building image (only the patch layer + compile step redo on a patch-only change) =="
 cd "$CTX_DIR"
-podman build -f Dockerfile.fullbuild -t dsv4-a100:devel .
+podman build -f Dockerfile.fullbuild -t "$IMAGE_TAG" .
 
-echo "== done: dsv4-a100:devel rebuilt =="
-podman images dsv4-a100:devel
+echo "== done: $IMAGE_TAG rebuilt =="
+podman images "$IMAGE_TAG"
