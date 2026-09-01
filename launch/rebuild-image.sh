@@ -93,7 +93,15 @@ echo "== patches apply clean and compile =="
 # exists and is readable. Real copy instead; vllm-base is source-only
 # (~110M), so this costs seconds, and the COPY layer still cache-hits since
 # podman keys on content, not on how it got into the context.
-rsync -a --delete "$BASE_DIR/" "$CTX_DIR/vllm-base/"
+#
+# rm the destination first and unconditionally: an earlier run of this
+# script (before this fix) could have left CTX_DIR/vllm-base as a symlink
+# back to BASE_DIR itself, and `rsync -a --delete SRC/ DEST/` where DEST
+# resolves to SRC via that symlink syncs the tree into itself and DELETES
+# it. A plain directory here is harmless to remove; a stale self-pointing
+# symlink is exactly what must never reach the rsync below.
+rm -rf "$CTX_DIR/vllm-base"
+rsync -a "$BASE_DIR/" "$CTX_DIR/vllm-base/"
 cp "$FORK_DIR/docker/Dockerfile.fullbuild" "$CTX_DIR/Dockerfile.fullbuild"
 cp "$FORK_DIR/docker/dockerignore.txt" "$CTX_DIR/.dockerignore"
 
