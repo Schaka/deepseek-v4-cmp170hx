@@ -88,7 +88,12 @@ cd - > /dev/null
 rm -rf "$CHECK_DIR"
 echo "== patches apply clean and compile =="
 
-ln -sfn "$BASE_DIR" "$CTX_DIR/vllm-base"
+# A symlink here doesn't work -- podman's copier refuses to dereference a
+# symlink pointing outside the build context for COPY, even when the target
+# exists and is readable. Real copy instead; vllm-base is source-only
+# (~110M), so this costs seconds, and the COPY layer still cache-hits since
+# podman keys on content, not on how it got into the context.
+rsync -a --delete "$BASE_DIR/" "$CTX_DIR/vllm-base/"
 cp "$FORK_DIR/docker/Dockerfile.fullbuild" "$CTX_DIR/Dockerfile.fullbuild"
 cp "$FORK_DIR/docker/dockerignore.txt" "$CTX_DIR/.dockerignore"
 
