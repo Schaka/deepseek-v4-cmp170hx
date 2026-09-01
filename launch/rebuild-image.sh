@@ -48,13 +48,19 @@ else
   echo "$BASE" > "$MARKER"
 fi
 
-echo "== staging patches (skip 0001 -- upstreamed; skip 0009 -- already in $BASE, see docs/rebase-12810046c.md) =="
+echo "== staging patches (skip 0001/0009 -- already in $BASE; 0006 dropped entirely, see docs/rebase-12810046c.md) =="
 rm -rf "$CTX_DIR/patches"
 mkdir -p "$CTX_DIR/patches"
 for p in "$FORK_DIR"/patches/*.patch; do
   case "$p" in *0001-*|*0009-*) continue ;; esac
   cp "$p" "$CTX_DIR/patches/"
 done
+# rebase-12810046c-fixups/ isn't picked up by the glob above (subdirectory) --
+# copy it in explicitly, named to sort after 0019 and before 0020 so it lands
+# in the right place in the patch-apply loop's glob order. Only the one
+# hunk of 0019 that 12810046c doesn't already have -- see the patch header.
+cp "$FORK_DIR/patches/rebase-12810046c-fixups/0019-fixup-validate-tokens-ex.patch" \
+  "$CTX_DIR/patches/0019z-fixup-validate-tokens-ex.patch"
 
 echo "== syntax-checking patches against the base tree before spending build time =="
 CHECK_DIR=$(mktemp -d)
@@ -69,9 +75,22 @@ for p in "$CTX_DIR"/patches/*.patch; do
   # this branch). Capture full output, check patch's exit code
   # explicitly, and print everything if it failed.
   out=$(patch -p1 --forward < "$p" 2>&1) || {
-    echo "FAILED: $(basename "$p")" >&2
-    echo "$out" >&2
-    exit 1
+    # Known, expected exception on this branch: 0019's backend_xgrammar.py
+    # hunks are a package deal to `patch` (one redundant here, one not --
+    # see docs/rebase-12810046c.md), so it reports the whole file "Reversed
+    # or previously applied, skipping" and exits non-zero even though this
+    # is fine -- the very next patch in the loop (0019z fixup) supplies the
+    # one hunk that's actually missing. Anything else is a real failure.
+    if [ "$(basename "$p")" = "0019-grammar-salvage-and-dspark-desync-guards.patch" ] \
+      && printf '%s\n' "$out" | grep -q 'Reversed (or previously applied)' \
+      && [ "$(printf '%s\n' "$out" | grep -c '^patching file')" -eq 4 ]; then
+      echo "== 0019: expected backend_xgrammar.py partial-skip (fixup follows), continuing =="
+      find . -name '*.rej' -delete
+    else
+      echo "FAILED: $(basename "$p")" >&2
+      echo "$out" >&2
+      exit 1
+    fi
   }
   files=$(echo "$out" | grep '^patching file' | awk '{print $3}')
   CHANGED_PY="$CHANGED_PY $files"

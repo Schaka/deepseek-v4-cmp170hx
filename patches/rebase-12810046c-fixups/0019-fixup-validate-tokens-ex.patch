@@ -1,0 +1,63 @@
+From: deepseek-v4-cmp170hx
+Subject: [rebase-12810046c fixup] backend_xgrammar: add validate_tokens_ex,
+ the one hunk of 0019 that 12810046c doesn't already have
+
+CONTEXT. `0019`'s log-severity-demotion hunk (logger.error -> logger.debug
+for "FSM did not advance") is byte-identical to what's already in
+`12810046c` -- haosdent's own wtdcode backport got there first. `patch`
+correctly detects that hunk as already-applied, but its "Reversed or
+previously applied, skipping" heuristic swept BOTH of 0019's hunks to
+this file into the skip together, even though the second hunk
+(`validate_tokens_ex`, a non-advancing FSM probe that also reports
+termination -- lets the scheduler tell "grammar completed, trailing
+garbage" from "still mid-stream, real violation") is NOT present on this
+base and IS called from `vllm/v1/structured_output/__init__.py:704`
+(`getattr(grammar, "validate_tokens_ex", None)`), which `0019` DOES
+apply cleanly here. Without this fixup that getattr always returns
+None, silently disabling the type-A/type-B grammar-rejection split
+`0019` is supposed to provide on this base.
+
+NOT folded into `0019` itself -- `main` still needs `0019` unmodified
+against `c3046d1`, where this hunk is not redundant. This is
+`rebase-12810046c`-specific.
+
+Apply after `0019` in the sequence documented in
+`docs/rebase-12810046c.md` / `launch/rebuild-image.sh`. Touches
+`vllm/v1/structured_output/backend_xgrammar.py` only.
+--- a/vllm/v1/structured_output/backend_xgrammar.py
++++ b/vllm/v1/structured_output/backend_xgrammar.py
+@@ -192,6 +192,34 @@
+             self.matcher.rollback(len(accepted_tokens))
+         return accepted_tokens
+ 
++    def validate_tokens_ex(self, tokens: list[int]) -> tuple[list[int], bool]:
++        """Non-advancing probe that also reports FSM termination.
++
++        Like validate_tokens, but stops as soon as the FSM reaches its
++        terminal state and reports whether it did. Tokens past the
++        terminal state are definitionally unconstrained garbage, so the
++        caller can distinguish "grammar completed + trailing garbage"
++        (truncate-and-finish is safe) from a mid-stream violation (FSM
++        still live). Breaking before offering the next token to an
++        already-terminated matcher also avoids the xgrammar C++ warning
++        (grammar_matcher.cc:612).
++        """
++        if self._is_terminated:
++            return [], True
++        accepted_tokens = []
++        terminated = False
++        for token in tokens:
++            if not self.matcher.accept_token(token):
++                break
++            accepted_tokens.append(token)
++            if self.matcher.is_terminated():
++                terminated = True
++                break
++        if len(accepted_tokens) > 0:
++            # Rollback the FSM to the initial state
++            self.matcher.rollback(len(accepted_tokens))
++        return accepted_tokens, terminated
++
+     def rollback(self, num_tokens: int) -> None:
+         self.matcher.rollback(num_tokens)
+         self.num_processed_tokens -= num_tokens
