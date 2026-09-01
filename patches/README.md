@@ -88,6 +88,22 @@ On `c3046d1`:
   the gist (`0010`-`0015`) is built directly on #49117's baseline with zero fuzz and inherits
   it too. Adds a `TestReasoningStateOrphanInvoke` regression suite. Applies after `0015` in
   glob order; touches `vllm/parser/deepseek_v4.py` only.
+- **`0017` (new, 2026-09-01)** — opt-in "Let me..." phrase-lock repetition guard. Observed live
+  on this repo's served image at ~544k tokens of accumulated agentic context: a dozen
+  near-duplicate "Let me find the repro. / Let me check the repro. / ..." lines in a row.
+  `0008` (port of haosdent/vllm#21) reduces this but that PR's own author runs production
+  traffic through a separate, undisclosed "response guard" not included in its diff — not
+  public, we don't have its source. This is our version: `_dsv4_detect_repetition_loop()` in
+  `vllm/v1/engine/detokenizer.py` scans a trailing window of decoded text for lines sharing
+  both an opener and a repeated content word (the content-word check is what tells a real
+  loop apart from a legitimate parallel-structure list — "The function parses...", "The
+  function validates..." — which shares an opener but no topic and must not trigger), and on
+  a match sets `stop_string` exactly as if a configured stop string had matched, reusing the
+  existing tested abort path in `OutputProcessor` unmodified. Confirmed not a DSpark artifact
+  — reproduced with `--speculative-config` entirely absent, so `0007`'s NaN-argmax guard
+  (which only fires inside the rejection sampler) isn't in play. Env-gated, **off by default**
+  — set `DSV4_REPETITION_GUARD=1` to enable; see the patch header for all five tuning knobs.
+  Applies after `0016` in glob order; touches `vllm/v1/engine/detokenizer.py` only.
 - ⚠️ **The range touches `csrc/`** (`libtorch_stable/topk.cu` FilteredTopK decode routing —
   one of the real wins — plus `marlin.cu`, `custom_all_reduce.cuh`), so
   `VLLM_USE_PRECOMPILED=1` and the bind-mount method **cannot deliver the kernel changes**.
