@@ -89,15 +89,6 @@ tripwires in the same file. Applies after `0020` in glob order.
  
          # include_finished_set controls whether a separate set of finished
          # request ids should be included in the EngineCoreOutputs returned
-@@ -2443,7 +2456,7 @@
-         repeated content word beyond it, or None. Returns a synthetic
-         descriptor (not a literal line) for logging."""
-         min_lines = int(os.environ.get("DSV4_REP_FUZZY_MIN_LINES", "8"))
--        min_hits = int(os.environ.get("DSV4_REP_FUZZY_MIN_HITS", "12"))
-+        min_hits = int(os.environ.get("DSV4_REP_FUZZY_MIN_HITS", "6"))
-         prefix_words = int(os.environ.get("DSV4_REP_FUZZY_PREFIX_WORDS", "2"))
-         overlap = float(os.environ.get("DSV4_REP_FUZZY_CONTENT_OVERLAP", "0.35"))
- 
 @@ -2478,6 +2491,55 @@
                  return f"{_prefix}... [+{top_word}] x{len(tails)}"
          return None
