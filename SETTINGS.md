@@ -151,6 +151,33 @@ tripwires as the safety net, not the fix — the actual fix is the client sendin
 turn. (In opencode: set it under the model's `options.chat_template_kwargs` in `opencode.json`,
 not just once in a system prompt.)
 
+### `--override-generation-config '{"top_p":0.95}'`
+Official 0731 guidance for agentic/tool-calling use is `temperature=1.0, top_p=0.95` (vs
+`top_p=1.0` for general chat). Our launch scripts never set `top_p` at all before
+2026-09-01, so the server silently fell back to the checkpoint's `generation_config.json`
+default of `1.0` for every request — including agentic opencode sessions. Fixed via
+`--override-generation-config`, which applies server-side regardless of what the client
+sends.
+
+⚠️ **Tested 2026-09-01, alongside `--reasoning-parser deepseek_v4` (below): did NOT fix
+the >100k-context repetition-loop degeneration.** Loops still occurred. Root cause is
+believed to sit deeper than sampling — see
+[ggml-org/llama.cpp#26694](https://github.com/ggml-org/llama.cpp/issues/26694), an
+unresolved upstream report of the identical shape (long agentic chat, local serving only,
+temperature ruled out, suspected chat-template/stop-token boundary loss). Keep this flag
+set regardless — it matches official guidance and is very unlikely to hurt — but do not
+expect it alone to solve the loop problem. See `DSV4_RECOVERY_MODE` below for the
+scheduler-level mitigation this project actually relies on.
+
+### `--reasoning-parser deepseek_v4`
+See the ★ entry lower in this file for what this flag does and why it matters whenever
+thinking is enabled. **Gap found 2026-09-01:** this had been documented here as
+load-bearing since before the DSML/repetition patch series, but was missing from both
+`launch/run-pp-dspark.sh` and the (until then untracked) podman launcher actually used in
+production. Fixed in `launch/run-pp-dspark-podman.sh`. If you're running from an older
+checkout or a hand-rolled launch command, check this flag is actually present — docs
+saying to set something is not the same as a script setting it.
+
 ### `--max-num-seqs 8`
 Raise for serving. 128 was used for the concurrency sweeps and behaves well; DSpark keeps
 winning all the way to 64 concurrent requests on PP.
@@ -170,6 +197,7 @@ Standard for this model.
 | `CUDA_HOME` | set in image | The devel image sets `/usr/local/cuda`. |
 | **`DSV4_LOGITS_ROW_CHUNK`** | **`64`** for conversations; `256`/`128` for one-shot | ★ **The context-ceiling fix** ([patch 0006](patches/0006-logits-row-chunk.patch)). Row-chunks the sparse indexer's `[M, N]` float32 logits transient. `0` = original upstream path, which dies at ~134k. **One-shot prefill:** `256` reaches ~957,600, `128` reaches 1,047,736. **Accumulating conversation:** `128` dies at ~718–733k (reproduced twice); **`64` reached 1,002,852 over 405 turns.** Costs almost nothing (TTFT 7.48 s vs 7.08 s at 750k). Affects only whether it crashes — **not** retrieval accuracy. |
 | **`VLLM_PP_LAYER_PARTITION`** | `12,12,12,7` (4 cards) · `15,15,13` (3 cards) | Rebalances the 43 layers off pipeline rank 3, which uniquely carries `lm_head` **and** the DSpark drafter. **Does not affect the context ceiling** — but it removes an 8.7 GiB rank imbalance and grows the KV pool **~85%** (798,660 → 1,476,563 at `max-model-len 163840`). Must have one entry per pipeline rank, summing to 43. **On 3 cards this is required, not optional** — the default `[15,14,14]` fails during the Marlin FP4 expert repack because the last rank also carries `lm_head` and the DSpark drafter. |
+| **`DSV4_RECOVERY_MODE`** | `nudge` (default) or `reopen` | Repetition-loop recovery strategy ([patch 0021](patches/0021-repetition-recovery-nudge-splice.patch) / [0022](patches/0022-repetition-recovery-reopen-turn-mode.patch)). `nudge` splices freeform steering text mid-turn; `reopen` splices the real `<｜end▁of▁sentence｜><｜User｜>go<｜Assistant｜>` turn-boundary sequence instead. Live-tested past ~100k context: `nudge` fires (confirmed in logs) but the model can keep mutating into new short repeats and exhaust the retry budget without recovering. `reopen` is the current hypothesis for why — untested pending a real run. `DSV4_NUDGE=0` disables recovery entirely regardless of mode. |
 
 ⚠️ **Do not bother with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`** — it is a hard
 failure at model load on these cards: `expandable_segments: memory mapping failed with OOM on
