@@ -6,16 +6,30 @@
 # (libtorch_stable/topk.cu FilteredTopK decode routing -- one of the real decode
 # wins -- plus marlin.cu and custom_all_reduce.cuh), so a precompiled build
 # silently ships WITHOUT those kernels. Any base that touches csrc/ needs this
-# full build. Run it from the vLLM checkout root with the patches applied.
+# full build.
 #
-# Build time: ~115 min on a 32-core box. Watch for HUNG dependency `git clone`s
-# (triton -> deepgemm/cutlass -> flash-attn -> aiter -> composable_kernel run
-# serially; a wedged connection freezes at ~150 KB forever). Kill any clone
-# whose /proc/<pid>/io write_bytes is frozen ~90s -- the cmake wrapper retries.
+# Build time: ~115 min cold, far less on a patch-only rebuild -- see layering
+# note below. Watch for HUNG dependency `git clone`s (triton -> deepgemm/cutlass
+# -> flash-attn -> aiter -> composable_kernel run serially; a wedged connection
+# freezes at ~150 KB forever). Kill any clone whose /proc/<pid>/io write_bytes
+# is frozen ~90s -- the cmake wrapper retries.
 #
 # TORCH_CUDA_ARCH_LIST is pinned to 8.0 alone. Building every architecture is
 # what makes a vLLM source build take hours; one arch is a fraction of that, and
 # these are CMP 170HX (GA100, sm_80) so nothing else is needed.
+#
+# Layering / build context: run this from a directory containing two
+# subdirectories, NOT from inside the vLLM checkout itself --
+#   vllm-base/   pristine, unpatched c3046d1 tree (see patches/README.md for
+#                how to reconstruct it -- it's unreachable by any git method)
+#   patches/     this fork's patches/*.patch, copied in verbatim
+# Everything through the torch install below only depends on THIS file, so it
+# is cached across every rebuild. vllm-base/ only changes if the upstream base
+# commit moves. patches/ is the one thing that changes often -- it is COPYed
+# last, so a patch-only change reruns just the patch-apply-and-compile step,
+# not a multi-GB redownload of torch/rust/apt packages. See
+# launch/rebuild-image.sh for the script that sets this layout up and drives
+# the build. (rebuild-dsv4-image.sh on the test box is the deployed copy.)
 FROM nvidia/cuda:13.0.2-cudnn-devel-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -27,8 +41,38 @@ RUN python3.12 -m venv /opt/venv
 ENV PATH=/opt/venv/bin:/usr/local/cuda/bin:/usr/lib/ccache:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ENV CUDA_HOME=/usr/local/cuda
 
+# --no-build-isolation is required later (setup.py imports torch), which means
+# every build dependency from pyproject.toml's [build-system].requires must be
+# present in this environment first -- pip will not fetch them.
+RUN pip install --no-cache-dir -U pip "setuptools>=77.0.3,<81.0.0" wheel \
+        "setuptools-scm>=8.0" "setuptools-rust>=1.9.0" ninja "cmake>=3.26.1" \
+        "packaging>=24.2" jinja2
+# vLLM ships Rust components (rust/, build_rust.sh); rust-toolchain.toml pins
+# 1.95, so a distro rustc would be rejected.
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --default-toolchain 1.95 --profile minimal
+ENV PATH=/root/.cargo/bin:$PATH
+# torch first so the build can find it; version must match requirements/cuda.txt
+RUN pip install --no-cache-dir torch==2.13.0 torchaudio==2.11.0 torchvision==0.28.0
+
+# ---- everything above is independent of vLLM source and this fork's patches;
+# ---- it is cached across every rebuild, patch-only or not -----------------
+
 WORKDIR /vllm
-COPY . /vllm/
+# Pristine base tree first -- only invalidates the cache below when the
+# upstream base commit itself changes, which is rare.
+COPY vllm-base/ /vllm/
+
+# The fork's patches, applied as their own layer -- this is the one thing that
+# changes often, and it's COPYed last on purpose.
+COPY patches /tmp/patches
+RUN for p in /tmp/patches/*.patch; do \
+        case "$p" in *0001-*) continue ;; esac; \
+        echo "applying $(basename "$p")"; \
+        patch -p1 --forward < "$p" || exit 1; \
+    done && \
+    rm -rf /tmp/patches && \
+    find . -name '*.orig' -delete && find . -name '*.rej' -delete
 
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0
 ENV TORCH_CUDA_ARCH_LIST=8.0
@@ -36,19 +80,6 @@ ENV MAX_JOBS=32
 ENV CMAKE_BUILD_TYPE=Release
 ENV VLLM_TARGET_DEVICE=cuda
 
-# --no-build-isolation is required (setup.py imports torch), which means every
-# build dependency from pyproject.toml's [build-system].requires must be present
-# in this environment first -- pip will not fetch them.
-RUN pip install --no-cache-dir -U pip "setuptools>=77.0.3,<81.0.0" wheel \
-        "setuptools-scm>=8.0" "setuptools-rust>=1.9.0" ninja "cmake>=3.26.1" \
-        "packaging>=24.2" jinja2
-# vLLM now ships Rust components (rust/, build_rust.sh); rust-toolchain.toml
-# pins 1.95, so a distro rustc would be rejected.
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-      | sh -s -- -y --default-toolchain 1.95 --profile minimal
-ENV PATH=/root/.cargo/bin:$PATH
-# torch first so the build can find it; version must match requirements/cuda.txt
-RUN pip install --no-cache-dir torch==2.13.0 torchaudio==2.11.0 torchvision==0.28.0
 # No VLLM_USE_PRECOMPILED -- this compiles csrc/ so the PR fixes take effect.
 RUN rustc --version && pip install --no-cache-dir -e . --no-build-isolation
 

@@ -78,7 +78,11 @@ On `c3046d1`:
   one of the real wins — plus `marlin.cu`, `custom_all_reduce.cuh`), so
   `VLLM_USE_PRECOMPILED=1` and the bind-mount method **cannot deliver the kernel changes**.
   Build from source with [docker/Dockerfile.fullbuild](../docker/Dockerfile.fullbuild)
-  (sm_80-only, ~115 min) with the patches applied to the tree first.
+  (sm_80-only, ~115 min cold, far less on a patch-only rebuild). Use
+  [launch/rebuild-image.sh](../launch/rebuild-image.sh) rather than building by hand — it
+  reconstructs and caches the base tree, applies patches as their own docker layer (COPYed
+  last, on purpose), and only reruns the patch-apply-and-compile step when `patches/` changes,
+  instead of redownloading torch/rust/apt every time.
 - New env worth setting: `VLLM_MARLIN_FP8_DEQUANT_BF16=1` (upstream-adopted prefill win,
   −35 ms TTFT@8k on block-fp8 dense; inert but harmless on the INT4 repack).
   `VLLM_MARLIN_DENSE_OCCUPANCY` was refuted by its own authors (leave unset), and
