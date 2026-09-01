@@ -88,22 +88,15 @@ On `c3046d1`:
   the gist (`0010`-`0015`) is built directly on #49117's baseline with zero fuzz and inherits
   it too. Adds a `TestReasoningStateOrphanInvoke` regression suite. Applies after `0015` in
   glob order; touches `vllm/parser/deepseek_v4.py` only.
-- **`0017` (new, 2026-09-01)** — opt-in "Let me..." phrase-lock repetition guard. Observed live
-  on this repo's served image at ~544k tokens of accumulated agentic context: a dozen
-  near-duplicate "Let me find the repro. / Let me check the repro. / ..." lines in a row.
-  `0008` (port of haosdent/vllm#21) reduces this but that PR's own author runs production
-  traffic through a separate, undisclosed "response guard" not included in its diff — not
-  public, we don't have its source. This is our version: `_dsv4_detect_repetition_loop()` in
-  `vllm/v1/engine/detokenizer.py` scans a trailing window of decoded text for lines sharing
-  both an opener and a repeated content word (the content-word check is what tells a real
-  loop apart from a legitimate parallel-structure list — "The function parses...", "The
-  function validates..." — which shares an opener but no topic and must not trigger), and on
-  a match sets `stop_string` exactly as if a configured stop string had matched, reusing the
-  existing tested abort path in `OutputProcessor` unmodified. Confirmed not a DSpark artifact
-  — reproduced with `--speculative-config` entirely absent, so `0007`'s NaN-argmax guard
-  (which only fires inside the rejection sampler) isn't in play. Env-gated, **off by default**
-  — set `DSV4_REPETITION_GUARD=1` to enable; see the patch header for all five tuning knobs.
-  Applies after `0016` in glob order; touches `vllm/v1/engine/detokenizer.py` only.
+- ~~**`0017`**~~ — **retired, 2026-09-01.** Was an opt-in phrase-lock repetition guard living in
+  `vllm/v1/engine/detokenizer.py`: single-snapshot detection, no cross-step persistence, no
+  truncation, `stop_string`-based abort only. Superseded by `0020` (detection: china's exact-line
+  check plus this repo's own fuzzy varied-wording addition, merged into the same scheduler-level
+  mechanism) and `0021` (recovery: splices a corrective nudge and continues instead of just
+  aborting). No reason to run both — `0017`'s detection role is fully covered and it has no way
+  to participate in `0021`'s splice-and-continue design (it lives a layer below the scheduler,
+  which owns `num_computed_tokens` and the request's token-id lists). Deleted outright rather
+  than kept disabled; see git history for the file if needed.
 - **`0018`-`0020` (new, 2026-09-01)** — ported from
   [ChinaBoy0618/deepseek-v4-cmp170hx](https://github.com/ChinaBoy0618/deepseek-v4-cmp170hx), an
   independent, more mature deployment on the same fork lineage with extensive production soak
@@ -129,18 +122,35 @@ On `c3046d1`:
     `</assistant>`, `<tool_calls` that match neither DSML nor any real protocol — directly
     matches this repo's own observed `<system-remember>`/`<tool_use><tool_name>` hallucinations),
     and their exact-line-repeat phrase-lock check (cross-step streak persistence + actual token
-    history truncation, strictly more robust than `0017`'s single-snapshot/no-truncation
-    design). **Merges in a new fuzzy varied-wording detector** (`_dsv4_fuzzy_rep_lines()`,
-    this repo's own addition, not upstream) as a fallback alongside their exact-match check,
-    since their check only catches verbatim-repeated lines and would miss `0017`'s original
-    varied-wording "Let me find/check/search..." case — both loop shapes are real, confirmed on
-    this repo's own served image. A punctuation-stripping bug found and fixed during the merge
-    (see patch header) — first cut silently false-negatived on the exact case it was written
-    for.
-  Applies after `0017` in glob order; `0018` touches `vllm/parser/deepseek_v4.py`, `0019`
+    history truncation). **Merges in a new fuzzy varied-wording detector**
+    (`_dsv4_fuzzy_rep_lines()`, this repo's own addition, not upstream) as a fallback alongside
+    their exact-match check, since their check only catches verbatim-repeated lines and would
+    miss the varied-wording "Let me find/check/search..." case (originally caught by the now-
+    retired `0017`) — both loop shapes are real, confirmed on this repo's own served image. A
+    punctuation-stripping bug found and fixed during the merge (see patch header) — first cut
+    silently false-negatived on the exact case it was written for.
+  Applies after `0016` in glob order; `0018` touches `vllm/parser/deepseek_v4.py`, `0019`
   touches `vllm/v1/core/sched/scheduler.py` + `vllm/v1/structured_output/{__init__,
   backend_xgrammar}.py` + `vllm/v1/worker/gpu/spec_decode/dspark/speculator.py`, `0020` touches
   `vllm/v1/core/sched/scheduler.py` only (on top of `0019`'s changes there).
+- **`0021` (new, 2026-09-01)** — recovery, not just detection: when a `0020` tripwire fires,
+  splice a corrective nudge into the request's own token history and let generation continue in
+  the SAME turn, instead of ending it. Motivation confirmed by hand: after a tripwire aborts a
+  request, opencode's agent loop just stops (`finish_reason: "stop"` is indistinguishable from a
+  normal end of turn), but manually typing a short nudge ("go", "do it", "tool call then?") into
+  the dead conversation reliably and instantly unstuck the model. This automates exactly that.
+  Mechanism: appends the nudge's token ids to `_output_token_ids`/`_all_token_ids` without
+  advancing `request.num_computed_tokens` — the same rollback shape this file already uses for
+  speculative-decode rejection, so the scheduler's ordinary chunked-prefill math picks up the gap
+  and gives the nudge a real forward pass before decode resumes, rather than risking KV-cache
+  corruption from treating un-computed tokens as already-computed. Also caught, live: a collapsed-
+  vocabulary loop shape neither `0020` detector was originally tuned for (1-4 word fragments
+  shuffled in different orders — "Now capture." / "Capture now." / "Now capture both this ptrs.")
+  — still detected given enough repetitions in the real trace, confirming `0020`'s detection was
+  already adequate; what was missing was recovery, not detection. Retry-budget capped
+  (`DSV4_NUDGE_MAX_RETRIES`, default 2) so a model that won't take the hint still finishes
+  cleanly via the pre-`0021` path. `DSV4_NUDGE=0` reverts to finish-on-fire. Applies after `0020`
+  in glob order; touches `vllm/v1/core/sched/scheduler.py` only.
 - ⚠️ **The range touches `csrc/`** (`libtorch_stable/topk.cu` FilteredTopK decode routing —
   one of the real wins — plus `marlin.cu`, `custom_all_reduce.cuh`), so
   `VLLM_USE_PRECOMPILED=1` and the bind-mount method **cannot deliver the kernel changes**.

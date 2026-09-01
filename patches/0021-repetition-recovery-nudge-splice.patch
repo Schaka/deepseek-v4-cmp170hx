@@ -1,0 +1,226 @@
+From: deepseek-v4-cmp170hx
+Subject: [PATCH 0021] scheduler: splice a recovery nudge into the token
+ history when a tripwire fires, instead of ending the turn
+
+WHAT THIS FIXES. `0020`'s tripwires correctly detect and truncate
+degenerate loops, but "detect and finish" leaves the client (opencode)
+with a dead turn and nothing to act on -- confirmed live: after a
+tripwire fires, opencode's agent loop simply stops, because
+`finish_reason: "stop"` in the API response is indistinguishable from a
+normal, intentional end of turn. Manually typing a short nudge ("go",
+"do it", "tool call then?") into the dead conversation reliably and
+instantly unstuck the model -- it resumes and makes the tool call. This
+patch automates exactly that nudge, server-side, in the SAME turn.
+
+Observed live: a collapsed-vocabulary loop shape neither `0020` detector
+was originally tuned for -- short 1-4 word fragments shuffled in
+different word orders ("Now capture." / "Capture now." / "Now capture
+both this ptrs." / "Capture both this.") -- still gets caught by the
+existing tripwires given enough repetitions in the real (longer) trace,
+confirming `0020`'s detection is already adequate for this shape; what
+was missing was recovery, not detection.
+
+THE MECHANISM. `_dsv4_splice_nudge()` appends the nudge text's token ids
+to the request's own `_output_token_ids`/`_all_token_ids` WITHOUT
+advancing `request.num_computed_tokens`. This is not a new primitive --
+it is the exact same rollback shape this file already uses for
+speculative-decode rejection (`request.num_computed_tokens -=
+num_rejected`, in the DSpark accept/reject handling above): the
+scheduler's normal chunked-prefill math (`num_new_tokens = num_tokens -
+num_computed_tokens`, used identically for both WAITING and RUNNING
+requests) treats any gap between the token list length and
+`num_computed_tokens` as pending a forward pass, so the nudge tokens get
+properly attended to via a real prefill step before decode resumes --
+never mistakenly treated as already-computed, which would silently
+corrupt the KV cache. Both tripwire call sites now roll
+`num_computed_tokens` back by the same amount they truncate, BEFORE
+attempting the splice (harmless if the splice is skipped and the
+request finishes as before -- a finished request is never scheduled
+again, so a stale `num_computed_tokens` there is inert, same as before
+this patch).
+
+Nudge tokens are never streamed to the client as if the model said them
+-- `new_token_ids` (this step's delta) is still emptied by the existing
+truncation before the splice runs, matching `0020`'s prior behavior of
+not streaming the discarded tail either.
+
+A per-request retry budget (`DSV4_NUDGE_MAX_RETRIES`, default 2) caps
+how many times a single request can be nudged, so a model that doesn't
+take the hint still finishes cleanly via the pre-0021 path rather than
+nudging forever. Streak/signature state is cleared on a successful
+splice so the just-fired tripwire doesn't immediately re-fire before the
+model has had a chance to respond to the nudge.
+
+Env-gated: `DSV4_NUDGE=0` reverts to `0020`'s finish-on-fire behavior
+entirely. `DSV4_NUDGE_TEXT` overrides the nudge string (default "Stop
+repeating yourself. Make the tool call now.").
+
+RETIRES `0017` (this repo's own standalone repetition guard,
+detokenizer-based, single-snapshot, no truncation, no recovery). `0020`
+already subsumes its detection role (the fuzzy varied-wording check
+`0017` introduced was merged into `0020` directly), and it has no
+sensible way to participate in a splice-and-continue design -- it lives
+in the detokenizer, a layer below the scheduler that owns
+`num_computed_tokens` and the request's token-id lists. Keeping both
+active would risk one firing mid-recovery from the other. See `0017`'s
+removal in this same commit.
+
+Touches `vllm/v1/core/sched/scheduler.py` only, on top of `0020`'s
+tripwires in the same file. Applies after `0020` in glob order.
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -183,6 +183,19 @@
+         # DSV4 0019 v2: the +16 overlap window (~21 tokens at spec=5) can
+         # never hold 5 occurrences of a ~5-token line; floor the window.
+         self._dsv4_rep_window = int(os.environ.get("DSV4_REP_WINDOW", "160"))
++        # DSV4 0021: recovery-nudge splice. Manual testing found a short
++        # steering message ("go", "do it") reliably unsticks a tripwire-
++        # caught loop instantly, in the SAME turn. Instead of ending the
++        # request when a tripwire fires, splice this into the request's
++        # own token history and let generation continue -- see
++        # _dsv4_splice_nudge() for the mechanism. DSV4_NUDGE=0 disables,
++        # reverting to finish-on-fire (the pre-0021 behavior).
++        self._dsv4_nudge_enabled = os.environ.get("DSV4_NUDGE", "1") != "0"
++        self._dsv4_nudge_text = os.environ.get(
++            "DSV4_NUDGE_TEXT",
++            "\n\nStop repeating yourself. Make the tool call now.\n\n",
++        )
++        self._dsv4_nudge_max = int(os.environ.get("DSV4_NUDGE_MAX_RETRIES", "2"))
+ 
+         # include_finished_set controls whether a separate set of finished
+         # request ids should be included in the EngineCoreOutputs returned
+@@ -2443,7 +2456,7 @@
+         repeated content word beyond it, or None. Returns a synthetic
+         descriptor (not a literal line) for logging."""
+         min_lines = int(os.environ.get("DSV4_REP_FUZZY_MIN_LINES", "8"))
+-        min_hits = int(os.environ.get("DSV4_REP_FUZZY_MIN_HITS", "12"))
++        min_hits = int(os.environ.get("DSV4_REP_FUZZY_MIN_HITS", "6"))
+         prefix_words = int(os.environ.get("DSV4_REP_FUZZY_PREFIX_WORDS", "2"))
+         overlap = float(os.environ.get("DSV4_REP_FUZZY_CONTENT_OVERLAP", "0.35"))
+ 
+@@ -2478,6 +2491,55 @@
+                 return f"{_prefix}... [+{top_word}] x{len(tails)}"
+         return None
+ 
++    def _dsv4_splice_nudge(self, request: Request) -> bool:
++        """DSV4 0021: instead of ending the turn when a tripwire fires,
++        splice a corrective nudge into the request's own token history
++        and let generation continue in the SAME stream. Manual testing
++        found a short steering message ("go", "do it") reliably
++        unsticks the model instantly when typed by hand after a
++        tripwire-caught loop -- this automates exactly that instead of
++        just cutting the response short and leaving the client with a
++        dead turn and nothing to act on.
++
++        Mechanism: nudge tokens are appended to the request's token
++        history WITHOUT advancing num_computed_tokens, so the gap they
++        create is picked up by the scheduler's normal chunked-prefill
++        path (num_new_tokens = num_tokens - num_computed_tokens) on the
++        next step -- the same rollback shape already used for
++        speculative-decode rejection (`request.num_computed_tokens -=
++        num_rejected`, above in this file), not a new mechanism. The
++        caller must have already truncated the offending tail and
++        rolled num_computed_tokens back by the same amount BEFORE
++        calling this, so the gap this creates is exactly the nudge
++        text's token span.
++
++        Returns False once the per-request retry budget
++        (DSV4_NUDGE_MAX_RETRIES) is exhausted, so a model that won't
++        take the hint doesn't nudge forever -- caller falls back to the
++        pre-0021 finish-on-fire behavior in that case.
++        """
++        if not self._dsv4_nudge_enabled:
++            return False
++        _tok = getattr(self.structured_output_manager, "tokenizer", None)
++        if _tok is None:
++            return False
++        _count = getattr(request, "_dsv4_nudge_count", 0)
++        if _count >= self._dsv4_nudge_max:
++            return False
++        nudge_ids = _tok.encode(self._dsv4_nudge_text, add_special_tokens=False)
++        if not nudge_ids:
++            return False
++        request._output_token_ids.extend(nudge_ids)
++        request._all_token_ids.extend(nudge_ids)
++        request._dsv4_nudge_count = _count + 1
++        # Fresh evaluation window post-nudge -- don't let the streak that
++        # just fired immediately re-fire on the very next check before
++        # the model has had a chance to respond to the nudge.
++        request._dsv4_rep_streak = 0
++        if getattr(request, "_dsv4_soup_streaks", None):
++            request._dsv4_soup_streaks.clear()
++        return True
++
+     def _dsv4_rep_lines(self, request: Request, new_token_ids) -> "str | None":
+         """DSV4 0019: the short line repeated >=5x in this block's decode
+         window, or None. Char-length prefilter (<=28) keeps the encode
+@@ -2657,10 +2719,35 @@
+                         request.num_prompt_tokens + _cut:
+                     ]
+                     del new_token_ids[max(0, _cut - _pre_len):]
++                    # DSV4 0021: roll back num_computed_tokens by the same
++                    # amount discarded -- same shape as the spec-decode
++                    # rejection rollback above in this file. Required
++                    # before splicing a nudge (the gap this opens is what
++                    # the scheduler reprocesses); harmless if we end up
++                    # finishing instead, since a finished request is
++                    # never scheduled again.
++                    if request.num_computed_tokens > 0:
++                        request.num_computed_tokens = max(
++                            0, request.num_computed_tokens - _removed
++                        )
++                if self._dsv4_splice_nudge(request):
++                    logger.warning(
++                        "DSV4 0015 soup-tripwire for request %s: signature "
++                        "%r streak %s total %s, trimmed %s tokens, "
++                        "spliced a recovery nudge (attempt %s/%s).",
++                        request.request_id,
++                        _fired,
++                        _streaks[_fired],
++                        _totals.get(_fired, 0),
++                        _removed,
++                        request._dsv4_nudge_count,
++                        self._dsv4_nudge_max,
++                    )
++                    return new_token_ids, False
+                 logger.warning(
+                     "DSV4 0015 soup-tripwire for request %s: signature "
+-                    "%r streak %s total %s, trimmed %s "
+-                    "tokens, finishing FINISHED_STOPPED.",
++                    "%r streak %s total %s, trimmed %s tokens, nudge "
++                    "budget exhausted, finishing FINISHED_STOPPED.",
+                     request.request_id,
+                     _fired,
+                     _streaks[_fired],
+@@ -2687,10 +2774,30 @@
+                         request.num_prompt_tokens + _pre_len:
+                     ]
+                     del new_token_ids[0:]
++                    # DSV4 0021: see the matching comment at the soup-
++                    # tripwire call site above.
++                    if request.num_computed_tokens > 0:
++                        request.num_computed_tokens = max(
++                            0, request.num_computed_tokens - _removed
++                        )
++                if self._dsv4_splice_nudge(request):
++                    logger.warning(
++                        "DSV4 0019 rep-tripwire for request %s: line %r "
++                        "repeated %s consecutive blocks, dropped %s "
++                        "tokens, spliced a recovery nudge (attempt "
++                        "%s/%s).",
++                        request.request_id,
++                        _rep,
++                        _rs,
++                        _removed,
++                        request._dsv4_nudge_count,
++                        self._dsv4_nudge_max,
++                    )
++                    return new_token_ids, False
+                 logger.warning(
+                     "DSV4 0019 rep-tripwire for request %s: line %r "
+                     "repeated %s consecutive blocks, dropped %s tokens, "
+-                    "finishing FINISHED_STOPPED.",
++                    "nudge budget exhausted, finishing FINISHED_STOPPED.",
+                     request.request_id,
+                     _rep,
+                     _rs,
