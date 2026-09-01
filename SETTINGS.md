@@ -136,6 +136,21 @@ server-side with `--default-chat-template-kwargs`. **Use `high`, not `max`** —
 harder for identical recall. A top-level `reasoning_effort` body param is the ambiguous path; it
 changes behaviour but `/tokenize` cannot see it.
 
+★ **Set `reasoning_effort` explicitly on every request, not just the first one — agentic clients
+especially.** `0008` fixes the *default* (omitted now means thinking=True instead of silently
+falling back to chat mode), but that's a one-time fix for a single request's prompt rendering, not
+a guarantee across a long session. A session that never sends an explicit `reasoning_effort` can
+still drift over many turns into the self-reinforcing "Let me..." phrase-lock loop `0008`/`0016`-
+`0020` guard against — live testing on this repo's own served image found that pinning
+`chat_template_kwargs: {"reasoning_effort": "high"}` on **every** request measurably reduces how
+often loops occur in the first place, not just how quickly the repetition tripwires (`0017`,
+`0020`) catch one after the fact. This matches a finding independently reported by
+[wtdcode/vllm-backport](https://github.com/wtdcode/vllm-backport): *"sessions that run without the
+effort prefix gradually stop thinking and can enter self-reinforcing reasoning loops."* Treat the
+tripwires as the safety net, not the fix — the actual fix is the client sending this on every
+turn. (In opencode: set it under the model's `options.chat_template_kwargs` in `opencode.json`,
+not just once in a system prompt.)
+
 ### `--max-num-seqs 8`
 Raise for serving. 128 was used for the concurrency sweeps and behaves well; DSpark keeps
 winning all the way to 64 concurrent requests on PP.
