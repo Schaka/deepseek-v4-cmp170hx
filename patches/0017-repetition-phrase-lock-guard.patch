@@ -51,7 +51,7 @@ Env-gated, off by default (same convention as `DSV4_LOGITS_ROW_CHUNK`):
   DSV4_REPETITION_GUARD_WINDOW=4000     -- trailing chars scanned
   DSV4_REPETITION_GUARD_MIN_LINES=8     -- minimum lines before any check runs
   DSV4_REPETITION_GUARD_PREFIX_WORDS=2  -- opener length in words
-  DSV4_REPETITION_GUARD_MIN_HITS=6      -- min lines sharing an opener
+  DSV4_REPETITION_GUARD_MIN_HITS=12     -- min lines sharing an opener
   DSV4_REPETITION_GUARD_CONTENT_OVERLAP=0.35 -- min content-word frequency
 
 TESTED. Isolated unit tests against `_dsv4_detect_repetition_loop()`:
@@ -95,7 +95,7 @@ modifies.
 +# path below rather than adding a new code path.
 +_DSV4_REPETITION_GUARD_ENABLED = os.environ.get("DSV4_REPETITION_GUARD", "0") == "1"
 +_DSV4_REPETITION_GUARD_WINDOW = int(os.environ.get("DSV4_REPETITION_GUARD_WINDOW", "4000"))
-+_DSV4_REPETITION_GUARD_MIN_HITS = int(os.environ.get("DSV4_REPETITION_GUARD_MIN_HITS", "6"))
++_DSV4_REPETITION_GUARD_MIN_HITS = int(os.environ.get("DSV4_REPETITION_GUARD_MIN_HITS", "12"))
 +_DSV4_REPETITION_GUARD_PREFIX_WORDS = int(os.environ.get("DSV4_REPETITION_GUARD_PREFIX_WORDS", "2"))
 +_DSV4_REPETITION_GUARD_MIN_LINES = int(os.environ.get("DSV4_REPETITION_GUARD_MIN_LINES", "8"))
 +_DSV4_REPETITION_GUARD_STOP_REASON = "dsv4-repetition-guard: phrase-lock loop detected"

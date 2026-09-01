@@ -315,7 +315,7 @@ glob order.
 +        repeated content word beyond it, or None. Returns a synthetic
 +        descriptor (not a literal line) for logging."""
 +        min_lines = int(os.environ.get("DSV4_REP_FUZZY_MIN_LINES", "8"))
-+        min_hits = int(os.environ.get("DSV4_REP_FUZZY_MIN_HITS", "6"))
++        min_hits = int(os.environ.get("DSV4_REP_FUZZY_MIN_HITS", "12"))
 +        prefix_words = int(os.environ.get("DSV4_REP_FUZZY_PREFIX_WORDS", "2"))
 +        overlap = float(os.environ.get("DSV4_REP_FUZZY_CONTENT_OVERLAP", "0.35"))
 +
