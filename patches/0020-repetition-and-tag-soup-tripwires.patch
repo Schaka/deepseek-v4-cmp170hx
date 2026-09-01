@@ -1,0 +1,575 @@
+From: deepseek-v4-cmp170hx
+Subject: [PATCH 0020] scheduler: catch degenerate repetition loops and
+ hallucinated-tag "soup" mid-generation, trim, and finish cleanly
+ (squashed port of ChinaBoy0618/deepseek-v4-cmp170hx's 0014/0015/0017/
+ 0017v2/0019/0019v2, six commits on the shared fork lineage, PLUS a new
+ fuzzy varied-wording detector merged in below)
+
+WHAT THIS FIXES. Three related degenerate-generation classes observed in
+production on both this fork and ChinaBoy0618's independent deployment:
+
+1. HALLUCINATED CONTROL-TAG "SOUP". After grammar salvage (`0019`)
+   abandons structured-output enforcement, or independently at long
+   context with zero grammar involvement, the checkpoint can degrade
+   into emitting invented pseudo-tags that exist in neither DSML nor any
+   real protocol: `<tool_calls`, `<reference`, `<empty-tool-call`,
+   `</assistant>`, `<system-reminder>`, `<assistant_unitsummary>`, and
+   more (full list in `_DSV4_SIG_STRINGS` below) -- observed live on
+   THIS repo's own served image as an invented `<system-remember>` tag
+   and a hallucinated `<tool_use><tool_name>bash</tool_name>` dialect
+   neither DSML-shaped nor any known protocol. A streak (same signature
+   held for `DSV4_SOUP_STREAK`, default 12, consecutive scheduler
+   iterations) or cumulative-total (`DSV4_SOUP_TOTAL`, default 18, across
+   the whole request -- sparse leakage that never saturates a streak)
+   trips the tripwire, trims the offending tail, and finishes the
+   request cleanly instead of letting it run to `max_tokens` of garbage.
+   A post-salvage token budget (`DSV4_SALVAGE_TOKEN_BUDGET`, default 64)
+   additionally bounds how long an unconstrained tail can run at all.
+
+2. EXACT-REPEAT PHRASE-LOCK. Verbatim short-line stutter -- "Grep."
+   repeated 326 times, "Lets reload." repeated 60+ times in one message
+   -- the model announcing an action in prose without ever emitting the
+   real tool call. Reported: 752/2717 assistant messages (28%) with zero
+   real tool_use blocks in one production session, worsening toward the
+   end. A line repeated >=5x in the trailing decode window (with a
+   char-length prefilter and a separator whitelist so `---`/`===`
+   dividers never trip it) triggers the same trim-and-finish path.
+
+3. VARIED-WORDING PHRASE-LOCK (this repo's own addition, not upstream in
+   ChinaBoy0618's fork). Observed live on THIS repo's served image at
+   ~544k accumulated tokens: a dozen near-duplicate but never verbatim
+   lines -- "Let me find the repro. / Let me check the repro. / Let me
+   search for prior repro artifacts." -- sharing an opener ("let me")
+   and a topic word ("repro") but literally never repeating the exact
+   same line, so (2)'s exact-match check never fires on it. Merged in
+   here as `_dsv4_fuzzy_rep_lines()`, a bucket-by-opener-then-require-
+   shared-content-word check operating on the SAME decoded window and
+   reusing the SAME streak/trim/finish machinery as (2) -- tried as a
+   fallback only when the exact check finds nothing. The content-word
+   requirement is what keeps a legitimate parallel-structure list ("The
+   function parses...", "The function validates...", ...  -- shares an
+   opener, no repeated topic) from tripping it; verified against the
+   real captured loop text (fires) and three false-positive stress
+   cases (does not fire): the parallel-structure list, a 14-line
+   realistic agentic response using "let me" 3 times legitimately, and
+   an 8-line short benign response.
+
+PORT NOTES. Squashes ChinaBoy0618/deepseek-v4-cmp170hx's `0014`
+(salvage-guard), `0015` (soup-tripwire base), `0017` (soup-signatures-
+extended), `0017v2` (soup-cumulative-total), `0019` (line-repetition-
+tripwire), and `0019v2` (rep-window floor) -- sequential, same file,
+same reasons this repo's own `0019` port squashes five upstream commits.
+Applied in a different order than their numbering (`0019`/`0019v2`
+before `0017v2`, since `0017v2`'s own diff was captured against a repo
+state that already included `0019`'s comments -- their numbering tracks
+roughly-chronological production hotfixes, not a strictly bisectable
+patch sequence) -- what ships here is the verified FINAL state as one
+clean diff, not a replay of that path. `0017v2`'s hunks 2-3 were already
+satisfied by content `0019`/`0019v2` introduced at the same call site;
+applied only its one new line (the `_dsv4_soup_total` declaration).
+
+Then merges this repo's own `_dsv4_fuzzy_rep_lines()` in as a sibling to
+`_dsv4_rep_lines()`, called as a fallback from the same function so both
+detectors share one streak counter and one trim/finish call site. One
+bug found and fixed during merge: the fuzzy detector's content-word
+extraction didn't strip trailing sentence punctuation, so "repro."
+(end-of-sentence) and "repro" (mid-sentence) counted as different words,
+fragmenting the count below threshold and producing a false negative on
+the very case it was written for -- fixed by stripping
+`.,!?;:"')]([` from each word before counting.
+
+Touches `vllm/v1/core/sched/scheduler.py` only, on top of `0019`'s
+grammar-salvage/desync guards in the same file. Applies after `0019` in
+glob order.
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -68,6 +68,39 @@
+ 
+ 
+ class Scheduler(SchedulerInterface):
++    # DSV4 0014 C': hallucinated control-tag signatures observed in the
++    # 2026-08-18 dead session (unconstrained post-salvage tail emitting
++    # mixed XML/DSML tag soup). Deliberately excludes any string that
++    # can occur in legitimate structured output (e.g. the DSML invoke
++    # special token itself).
++    _DSV4_SIG_STRINGS = (
++        "<reference",
++        "<tool_calls",
++        "<tool-call-name",
++        "<dies_cmd_wrapper",
++        "<empty-tool-call",
++        "<original_code_end",
++        "<commit_begin",
++        "text_placeholder",
++        "<edit-path",
++        "<source>placeholder",
++        "<original_output",
++        # DSV4 0017 P0-a: pseudo-tags observed in the 2026-08-19 issue
++        # sessions (73db6fa4 XML leak / 1cff1626 meta-tag forge).
++        # Output-side hallucinations only -- zero intersection with the
++        # legit DSML syntax set or <think>/</think> (tdd U04/U05);
++        # one-shot legit mentions survive the streak-12 semantics.
++        "<Write ",
++        "<bash_command",
++        "<call ",
++        "<answer>",
++        "<analyze>",
++        "<thinking>",
++        "</assistant>",
++        "<assistant_unitsummary>",
++        "<system-reminder>",
++    )
++
+     def __init__(
+         self,
+         vllm_config: VllmConfig,
+@@ -96,6 +129,61 @@
+         self.structured_output_manager = structured_output_manager
+         self.is_encoder_decoder = vllm_config.model_config.is_encoder_decoder
+ 
++        # DSV4 0014 C': how many trailing tokens to cut when a signature
++        # fires (longest signature's token length + tokenization slack).
++        # Zero (watch inert) when the tokenizer is unavailable -- but
++        # then no grammar work exists either, so salvage cannot fire.
++        _tok = getattr(structured_output_manager, "tokenizer", None)
++        if _tok is not None:
++            self._dsv4_sig_cutback = (
++                max(
++                    len(_tok.encode(s, add_special_tokens=False))
++                    for s in self._DSV4_SIG_STRINGS
++                )
++                + 2
++            )
++        else:
++            self._dsv4_sig_cutback = 0
++
++        # DSV4 0015: first-token ids of every signature, for the cheap
++        # tail prefilter (scan 24 ids against a set before decoding).
++        if _tok is not None:
++            self._dsv4_sig_first_ids = frozenset(
++                _ids[0]
++                for _ids in (
++                    _tok.encode(s, add_special_tokens=False)
++                    for s in self._DSV4_SIG_STRINGS
++                )
++                if _ids
++            )
++        else:
++            self._dsv4_sig_first_ids = frozenset()
++        # DSV4 0015: always-on degenerate tag-soup tripwire. The dead
++        # session AND the 2026-08-19 replay showed soup imitation with
++        # zero grammar-salvage involvement, so the 0014 post-salvage
++        # watch alone cannot bound it. Streak semantics: the SAME
++        # signature must persist in the 24-token tail for this many
++        # consecutive scheduler iterations before firing, so one-shot
++        # legitimate mentions (e.g. writing this very patch) never
++        # trigger. DSV4_SOUP_TRIPWIRE=0 disables.
++        self._dsv4_soup_enabled = (
++            os.environ.get("DSV4_SOUP_TRIPWIRE", "1") != "0"
++            and bool(self._dsv4_sig_first_ids)
++        )
++        self._dsv4_soup_streak = int(os.environ.get("DSV4_SOUP_STREAK", "12"))
++        # DSV4 0017 v2: sparse pseudo-tag leakage cannot saturate the
++        # consecutive streak; fire on cumulative detection-blocks too.
++        self._dsv4_soup_total = int(os.environ.get("DSV4_SOUP_TOTAL", "18"))
++        # DSV4 0019: line-repetition tripwire knobs (issue-2 loops).
++        self._dsv4_rep_enabled = (
++            os.environ.get("DSV4_REPETITION_TRIPWIRE", "1") != "0"
++            and _tok is not None
++        )
++        self._dsv4_rep_streak = int(os.environ.get("DSV4_REP_STREAK", "6"))
++        # DSV4 0019 v2: the +16 overlap window (~21 tokens at spec=5) can
++        # never hold 5 occurrences of a ~5-token line; floor the window.
++        self._dsv4_rep_window = int(os.environ.get("DSV4_REP_WINDOW", "160"))
++
+         # include_finished_set controls whether a separate set of finished
+         # request ids should be included in the EngineCoreOutputs returned
+         # by update_from_outputs(). This is currently used in the multi-engine
+@@ -1901,6 +1989,44 @@
+                         )
+                         # read-only property: the next line flips use_structured_output
+                         request.structured_output_request = None
++                        # DSV4 0014: bound the unconstrained tail this
++                        # just opened. Salvage fires at most once per
++                        # request (the property flip above gates the
++                        # FSM check), so the guard is armed exactly
++                        # here:
++                        #   A) a token budget so the tail cannot run
++                        #      to max_tokens (DSV4_SALVAGE_TOKEN_BUDGET,
++                        #      default 64; negative disables);
++                        #   C') a degenerate-signature watch that
++                        #      finishes the request the moment the
++                        #      model starts emitting hallucinated
++                        #      control tags (DSV4_SALVAGE_GUARD=0
++                        #      disables).
++                        # Fields attach dynamically (Request has no
++                        # __slots__); _update_request_with_output reads
++                        # them via getattr defaults.
++                        try:
++                            _budget = int(
++                                os.environ.get(
++                                    "DSV4_SALVAGE_TOKEN_BUDGET", "64"
++                                )
++                            )
++                        except ValueError:
++                            _budget = 64
++                        request._dsv4_post_salvage_budget = (
++                            _budget if _budget >= 0 else None
++                        )
++                        request._dsv4_sig_watch = (
++                            os.environ.get("DSV4_SALVAGE_GUARD", "1") != "0"
++                            and self._dsv4_sig_cutback > 0
++                        )
++                        logger.info(
++                            "DSV4 0014 salvage-guard armed for request %s "
++                            "(budget=%s, sig_watch=%s)",
++                            req_id,
++                            _budget,
++                            request._dsv4_sig_watch,
++                        )
+ 
+             if observed_spec_decode:
+                 spec_decoding_stats = self.make_spec_decoding_stats(
+@@ -2236,6 +2362,151 @@
+         self._enqueue_waiting_request(request)
+         return False
+ 
++    def _dsv4_signature_hit(self, request: Request) -> bool:
++        """DSV4 0014 C': does the decoded output tail contain a
++        hallucinated control-tag signature? Decode (not id-sequence
++        matching) so context-dependent tokenization cannot evade it."""
++        _tok = getattr(self.structured_output_manager, "tokenizer", None)
++        if _tok is None:
++            return False
++        _tail = _tok.decode(request._output_token_ids[-24:])
++        return any(_s in _tail for _s in self._DSV4_SIG_STRINGS)
++
++    def _dsv4_soup_tags(self, request: Request, new_token_ids) -> set:
++        """DSV4 0015 v3: which signatures appear in the tokens appended
++        THIS block plus a 16-token overlap. A tag only counts while new
++        tokens keep arriving around it -- a legit tag parked at the end
++        of the output stops counting immediately, while soup keeps
++        producing tags every block. First-token prefilter keeps the
++        common case at an id scan with no tokenizer call."""
++        _win = request._output_token_ids[-(len(new_token_ids) + 16):]
++        if not any(_t in self._dsv4_sig_first_ids for _t in _win):
++            return set()
++        _tok = getattr(self.structured_output_manager, "tokenizer", None)
++        if _tok is None:
++            return set()
++        _txt = _tok.decode(_win)
++        return {_s for _s in self._DSV4_SIG_STRINGS if _s in _txt}
++
++    def _dsv4_clean_cut(self, out_tail, decode, max_back: int = 16) -> int:
++        """DSV4 0017 P0-b: how many trailing tokens to drop so the visible
++        text does not end inside a half-written tag fragment. Fires only
++        when the decoded tail ends in an unclosed '<' + tagname run (no
++        '>' after the last '<', tagname starts alpha or '/'), so 'a < b'
++        math/prose never triggers. Bounded by max_back tokens."""
++        n = len(out_tail)
++        if n == 0:
++            return 0
++        txt = decode(out_tail[-min(n, 64):])
++        lt = txt.rfind("<")
++        if lt < 0:
++            return 0
++        after = txt[lt + 1:]
++        if not after:
++            return min(1, max_back)  # bare trailing '<'
++        if ">" in after:
++            return 0  # tag closed -> clean boundary
++        first = after[0]
++        if not (first.isalpha() or first == "/"):
++            return 0  # '< ' + space == not a tag start
++        if len(after) > 64:
++            return 0  # implausible fragment, leave it
++        need = len(txt) - lt  # chars from '<' to end of tail
++        for k in range(1, min(max_back, n) + 1):
++            if len(decode(out_tail[-k:])) >= need:
++                return k
++        return min(max_back, n)
++
++    _DSV4_REP_WHITELIST = frozenset({
++        "---", "===", "***", "___", "--", "==", "```", "---...",
++    })
++
++    # DSV4 0020: fuzzy phrase-lock detector, merged in alongside the
++    # exact-line-repeat check above. deepseek-v4-cmp170hx observed a
++    # SEPARATE loop shape on this fork's own served image: varied-wording
++    # "Let me find the repro. / Let me check the repro. / Let me search
++    # for prior repro artifacts." -- a dozen near-duplicate lines that
++    # share an opener ("let me") and a topic word ("repro") but are never
++    # verbatim-identical, so the exact match above (which requires the
++    # SAME line 5+ times) never fires on them. Requiring a shared CONTENT
++    # word (not just the opener) is what keeps this from firing on a
++    # legitimate parallel-structure list ("The function parses...",
++    # "The function validates...") that shares an opener but no topic.
++    _DSV4_REP_FUZZY_STOPWORDS = frozenset({
++        "let", "me", "the", "a", "an", "to", "for", "and", "or",
++        "of", "in", "on", "at", "is", "it", "this", "that", "i",
++        "will", "now", "then",
++    })
++
++    def _dsv4_fuzzy_rep_lines(self, txt: str) -> "str | None":
++        """DSV4 0020: a cluster of lines sharing a 2-word opener AND a
++        repeated content word beyond it, or None. Returns a synthetic
++        descriptor (not a literal line) for logging."""
++        min_lines = int(os.environ.get("DSV4_REP_FUZZY_MIN_LINES", "8"))
++        min_hits = int(os.environ.get("DSV4_REP_FUZZY_MIN_HITS", "6"))
++        prefix_words = int(os.environ.get("DSV4_REP_FUZZY_PREFIX_WORDS", "2"))
++        overlap = float(os.environ.get("DSV4_REP_FUZZY_CONTENT_OVERLAP", "0.35"))
++
++        lines = [_l.strip().lower() for _l in txt.splitlines()]
++        lines = [_l for _l in lines if _l and _l not in self._DSV4_REP_WHITELIST]
++        if len(lines) < min_lines:
++            return None
++
++        buckets: dict[str, list[list[str]]] = {}
++        for _ln in lines:
++            words = _ln.split()
++            if len(words) < prefix_words:
++                continue
++            prefix = " ".join(words[:prefix_words])
++            buckets.setdefault(prefix, []).append(words[prefix_words:])
++
++        for _prefix, tails in buckets.items():
++            if len(tails) < min_hits:
++                continue
++            content_counts: dict[str, int] = {}
++            for tail_words in tails:
++                for w in {t.strip(".,!?;:\"\')]([") for t in tail_words}:
++                    if w in self._DSV4_REP_FUZZY_STOPWORDS or len(w) < 3:
++                        continue
++                    content_counts[w] = content_counts.get(w, 0) + 1
++            if not content_counts:
++                continue
++            top_word, top_count = max(
++                content_counts.items(), key=lambda kv: kv[1]
++            )
++            if top_count / len(tails) >= overlap:
++                return f"{_prefix}... [+{top_word}] x{len(tails)}"
++        return None
++
++    def _dsv4_rep_lines(self, request: Request, new_token_ids) -> "str | None":
++        """DSV4 0019: the short line repeated >=5x in this block's decode
++        window, or None. Char-length prefilter (<=28) keeps the encode
++        check rare; separators whitelisted; long lines never flagged.
++        DSV4 0020: falls back to the fuzzy varied-wording check above
++        when the exact check finds nothing -- different loop shape, same
++        decoded window, same streak/cutback machinery below."""
++        _tok = getattr(self.structured_output_manager, "tokenizer", None)
++        if _tok is None:
++            return None
++        _w = max(len(new_token_ids) + 16,
++                 getattr(self, "_dsv4_rep_window", 160))
++        _win = request._output_token_ids[-_w:]
++        if not _win:
++            return None
++        _txt = _tok.decode(_win)
++        _counts: dict[str, int] = {}
++        for _ln in _txt.splitlines():
++            _ln = _ln.strip()
++            if not _ln or len(_ln) > 28 or _ln in self._DSV4_REP_WHITELIST:
++                continue
++            _counts[_ln] = _counts.get(_ln, 0) + 1
++        for _ln, _n in _counts.items():
++            if _n >= 5 and len(_tok.encode(_ln, add_special_tokens=False)) <= 6:
++                return _ln
++        if os.environ.get("DSV4_REP_FUZZY", "1") != "0":
++            return self._dsv4_fuzzy_rep_lines(_txt)
++        return None
++
+     def _update_request_with_output(
+         self, request: Request, new_token_ids: list[int], is_stale: bool = False
+     ) -> tuple[list[int], bool]:
+@@ -2244,15 +2515,190 @@
+         # a request is still being prefilled, we expect the model runner
+         # to return empty token ids for the request.
+         stopped = False
++        # DSV4 0014 A/C': post-salvage guard state captured once per
++        # block; both stay inert for every non-salvaged request.
++        _guard_armed = (
++            getattr(request, "_dsv4_post_salvage_budget", None) is not None
++            or getattr(request, "_dsv4_sig_watch", False)
++        )
++        _pre_len = len(request._output_token_ids)
+         for num_new, output_token_id in enumerate(new_token_ids, 1):
+             request.append_output_token_ids(output_token_id)
+ 
++            if _guard_armed:
++                # DSV4 0014-A: budget exhausted -> finish with
++                # stock-stop semantics (committed tokens stay, no
++                # further tokens). May preempt min_tokens; that guard
++                #                 exists to stop early EOS, not server-side damage
++                #                 control on an already off-constraint request.
++                _budget = getattr(request, "_dsv4_post_salvage_budget", None)
++                if _budget is not None:
++                    _budget -= 1
++                    request._dsv4_post_salvage_budget = _budget
++                    if _budget < 0:
++                        # DSV4 0017 P0-b: back the cut up to the last
++                        # unclosed '<' so the stream does not end
++                        # mid-tag (bounded 16 tokens; same
++                        # finish-this-iteration invariant as C'/TYPE-A).
++                        _out_t = request._output_token_ids
++                        _drop_n = 0
++                        if len(_out_t) > _pre_len:
++                            _tokm = getattr(
++                                self.structured_output_manager,
++                                "tokenizer",
++                                None,
++                            )
++                            if _tokm is not None:
++                                _drop_n = self._dsv4_clean_cut(
++                                    _out_t[-64:], _tokm.decode, 16
++                                )
++                                _drop_n = min(
++                                    _drop_n, len(_out_t) - _pre_len
++                                )
++                        if _drop_n > 0:
++                            _cutc = len(_out_t) - _drop_n
++                            del _out_t[_cutc:]
++                            del request._all_token_ids[
++                                request.num_prompt_tokens + _cutc:
++                            ]
++                            if _cutc - _pre_len < len(new_token_ids):
++                                del new_token_ids[
++                                    max(0, _cutc - _pre_len):
++                                ]
++                            logger.warning(
++                                "DSV4 0017 salvage-cap clean-cut for %s: "
++                                "dropped %s mid-tag tail tokens.",
++                                request.request_id,
++                                _drop_n,
++                            )
++                        logger.warning(
++                            "DSV4 0014 salvage-cap hit for request %s: "
++                            "finishing FINISHED_STOPPED after the "
++                            "post-salvage budget.",
++                            request.request_id,
++                        )
++                        request.status = RequestStatus.FINISHED_STOPPED
++                        request.resumable = False
++                        del new_token_ids[num_new:]
++                        return new_token_ids, True
++                # DSV4 0014-C': hallucinated control tag in the decoded
++                # tail -> trim the in-flight signature tokens and
++                # finish. The request ends this iteration, so no later
++                # spec window observes the cut (the same invariant as
++                # the stock stop truncation and 0013 TYPE-A).
++                if (
++                    getattr(request, "_dsv4_sig_watch", False)
++                    and self._dsv4_signature_hit(request)
++                ):
++                    _out = request._output_token_ids
++                    _cut = max(
++                        _pre_len, len(_out) - self._dsv4_sig_cutback
++                    )
++                    _removed = len(_out) - _cut
++                    del _out[_cut:]
++                    del request._all_token_ids[
++                        request.num_prompt_tokens + _cut:
++                    ]
++                    del new_token_ids[max(0, _cut - _pre_len):]
++                    logger.warning(
++                        "DSV4 0014 degenerate-signature for request %s: "
++                        "trimmed %s tail tokens, finishing "
++                        "FINISHED_STOPPED.",
++                        request.request_id,
++                        _removed,
++                    )
++                    request.status = RequestStatus.FINISHED_STOPPED
++                    request.resumable = False
++                    return new_token_ids, True
++
+             # Check for stop and update request state.
+             # This must be called before we make the EngineCoreOutput.
+             stopped = check_stop(request, self.max_model_len)
+             if stopped:
+                 del new_token_ids[num_new:]  # Trim new tokens if needed.
+                 break
++        # DSV4 0015: always-on degenerate tag-soup tripwire, streak
++        # semantics. Real soup keeps the same signature inside the
++        # 24-token tail for dozens of consecutive iterations; a
++        # legitimate one-shot listing keeps each tag alive only ~6-7
++        # windows (tag tokens + window), so streak 12 separates them.
++        # Uses the same finish-this-iteration truncation invariant as
++        # 0013 TYPE-A and 0014 C' (cut floored at _pre_len: never
++        # touches tokens committed by earlier iterations).
++        if not stopped and self._dsv4_soup_enabled:
++            _tags = self._dsv4_soup_tags(request, new_token_ids)
++            if getattr(request, "_dsv4_soup_streaks", None) is None:
++                request._dsv4_soup_streaks = {}
++            _streaks = request._dsv4_soup_streaks
++            for _s in _streaks:
++                if _s not in _tags:
++                    _streaks[_s] = 0
++            _fired = None
++            _totals = getattr(request, "_dsv4_sig_totals", None)
++            if _totals is None:
++                _totals = {}
++                request._dsv4_sig_totals = _totals
++            for _s in _tags:
++                _streaks[_s] = _streaks.get(_s, 0) + 1
++                _totals[_s] = _totals.get(_s, 0) + 1
++                if (
++                    _streaks[_s] >= self._dsv4_soup_streak
++                    or _totals[_s] >= self._dsv4_soup_total
++                ):
++                    _fired = _s
++                    break
++            if _fired is not None:
++                _out = request._output_token_ids
++                _cut = max(_pre_len, len(_out) - self._dsv4_sig_cutback)
++                _removed = len(_out) - _cut
++                if _removed > 0:
++                    del _out[_cut:]
++                    del request._all_token_ids[
++                        request.num_prompt_tokens + _cut:
++                    ]
++                    del new_token_ids[max(0, _cut - _pre_len):]
++                logger.warning(
++                    "DSV4 0015 soup-tripwire for request %s: signature "
++                    "%r streak %s total %s, trimmed %s "
++                    "tokens, finishing FINISHED_STOPPED.",
++                    request.request_id,
++                    _fired,
++                    _streaks[_fired],
++                    _totals.get(_fired, 0),
++                    _removed,
++                )
++                request.status = RequestStatus.FINISHED_STOPPED
++                request.resumable = False
++                return new_token_ids, True
++        # DSV4 0019: line-repetition tripwire (issue-2 announce-loops:
++        # "Lets reload."x60 / "Grep."xN inside ONE message). Cut is
++        # floored at _pre_len: drops only this block's tokens; request
++        # finishes this iteration so no future spec window sees the cut.
++        if not stopped and self._dsv4_rep_enabled:
++            _rep = self._dsv4_rep_lines(request, new_token_ids)
++            _rs = (getattr(request, "_dsv4_rep_streak", 0) + 1) if _rep else 0
++            request._dsv4_rep_streak = _rs
++            if _rs >= self._dsv4_rep_streak:
++                _out = request._output_token_ids
++                _removed = len(_out) - _pre_len
++                if _removed > 0:
++                    del _out[_pre_len:]
++                    del request._all_token_ids[
++                        request.num_prompt_tokens + _pre_len:
++                    ]
++                    del new_token_ids[0:]
++                logger.warning(
++                    "DSV4 0019 rep-tripwire for request %s: line %r "
++                    "repeated %s consecutive blocks, dropped %s tokens, "
++                    "finishing FINISHED_STOPPED.",
++                    request.request_id,
++                    _rep,
++                    _rs,
++                    _removed,
++                )
++                request.status = RequestStatus.FINISHED_STOPPED
++                request.resumable = False
++                return new_token_ids, True
+         return new_token_ids, stopped
+ 
+     def _free_encoder_inputs(self, request: Request) -> None:

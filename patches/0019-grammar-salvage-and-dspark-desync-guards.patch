@@ -1,0 +1,606 @@
+From: deepseek-v4-cmp170hx
+Subject: [PATCH 0019] scheduler: survive grammar rejections and DSpark
+ draft-buffer corruption instead of killing the request/worker (squashed
+ port of ChinaBoy0618/deepseek-v4-cmp170hx's 0008/0009/0010/0012/0013,
+ five commits on the same fork lineage this repo shares)
+
+WHAT THIS FIXES. Four related crash/corruption classes under DSpark
+speculative decoding plus grammar-constrained tool-call generation
+(`--enable-auto-tool-choice`, exercised on essentially every tool call
+this repo's launch config makes):
+
+1. GRAMMAR REJECTION KILLED THE REQUEST. Under `tool_choice=required`/
+   `response_format` plus DSpark, an FSM rejection ("Failed to advance
+   FSM") terminated the whole request with a 500, even though decoding
+   the rejected tokens showed a well-formed DSML envelope the parser
+   could otherwise have recovered -- the FSM was right to refuse, but
+   terminating is what hurt. Reported: 12 terminations in 80s production
+   traffic. Fix: abandon structured-output enforcement for that request
+   (unconstrained completion) instead of killing it; `0018`'s lenient
+   envelope and this repo's own recovery patches can still salvage a
+   tool call from the unconstrained tail.
+
+2. POST-HOC REJECTION VS PRE-COMMIT VALIDATION. The above is a
+   last-resort salvage; the principled fix validates an accepted
+   speculative block's grammar-valid prefix BEFORE committing it to
+   request history at all (port of upstream vllm-project/vllm#52452 +
+   #51870, both unmerged at port time), so requests don't hit the salvage
+   path to begin with in the common case.
+
+3. DSPARK DRAFT-BUFFER SENTINEL. DSpark can surface its draft-buffer
+   sentinel (id == vocab_size) as a sampled token when a degraded draft
+   stream meets an empty grammar row. Committing it feeds the sentinel
+   id back into the next forward embedding lookup and kills the worker
+   with a device-side assert (reported 2x in production, /v1/messages
+   with forced tools). Fix: truncate the block at the first out-of-vocab
+   id and roll back the suffix.
+
+4. SCHEDULER/WORKER HISTORY DESYNC. (1)-(3) originally truncated
+   speculative blocks on the SCHEDULER side only; the worker's
+   input_batch had already committed the full (untruncated) block, so
+   every truncation left the two token histories permanently desynced --
+   each later engine step re-sent the suffix, the spec window
+   misaligned, and the DSpark drafter eventually read its anchor from a
+   stale slot, producing an id >= vocab_size and a device-side assert on
+   the drafter's PP rank (reported 2x). Fix: stop truncating on the
+   scheduler side for the grammar and OOV paths (commit the block
+   unchanged, abandoning enforcement instead -- see (1)), and clamp the
+   drafter anchor read to `[0, get_vocab_size() - 1]` right at the buffer
+   read as defense in depth. A desynced anchor now costs one rejected
+   draft chain, not the worker. Also splits grammar rejections into
+   mid-stream (recoverable, same request continues unconstrained) vs
+   post-completion (the model is producing a garbage tail after the
+   grammar already reached its terminal state -- letting that stream
+   unconstrained just leaks tag soup to the client instead).
+
+PORT NOTES. Squashes ChinaBoy0618/deepseek-v4-cmp170hx's `0008`
+(grammar-salvage), `0009` (spec-decode-grammar-prefix), `0010`
+(dspark-oov-sentinel-guard), `0012` (scheduler-worker-desync), and `0013`
+(grammar-bifurcation) -- genuinely sequential, each building on the
+previous one's scheduler.py state, so they don't make sense ported
+independently; squashed here the same way this repo's own `0009` already
+squashes six upstream commits into one patch. Applied against our
+c3046d1 + `0002`-`0018` tree with three adaptations, all verified
+semantically equivalent to upstream intent (checked line-by-line, not
+just "applies"):
+
+- `0010`'s fourth hunk (`request.use_structured_output = False` ->
+  `request.structured_output_request = None`, a read-only-property
+  workaround) was already present verbatim at the same call site from
+  `0009`'s own diff -- dropped as redundant, not applied twice.
+- `0012`'s `launch/run-pp-dspark.sh` hunk was dropped -- that file lives
+  inside ChinaBoy0618's vLLM checkout tree; this repo's equivalent
+  script lives outside the vLLM source entirely, in this fork's own
+  `launch/`, and isn't part of what `patches/*.patch` touches.
+- `0013`'s second hunk (the `-> tuple[list[int], int, bool]` return-type
+  fixup in `vllm/v1/structured_output/__init__.py`) failed to apply as a
+  literal patch (raw `diff -u`-style headers in the source patch,
+  whitespace-sensitive) despite its context matching our tree
+  byte-for-byte; applied the identical semantic change by hand instead
+  of forcing a fuzzy match.
+
+Touches `vllm/v1/core/sched/scheduler.py`,
+`vllm/v1/structured_output/backend_xgrammar.py`,
+`vllm/v1/structured_output/__init__.py`, and
+`vllm/v1/worker/gpu/spec_decode/dspark/speculator.py` -- none of which
+any other patch in this series modifies. Applies after `0018` in glob
+order.
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
+ import itertools
+ import time
+ from collections import defaultdict, deque
+@@ -1766,9 +1767,13 @@
+             scheduled_spec_token_ids = (
+                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
+             )
++            observed_spec_decode = False
++            num_draft_tokens = 0
++            num_accepted = 0
+             if scheduled_spec_token_ids and (
+                 generated_token_ids or self.num_sampled_tokens_per_step == 0
+             ):
++                observed_spec_decode = True
+                 num_draft_tokens = len(scheduled_spec_token_ids)
+                 num_sampled = self.num_sampled_tokens_per_step
+                 num_accepted = max(len(generated_token_ids) - num_sampled, 0)
+@@ -1782,13 +1787,6 @@
+                         request.num_computed_tokens -= num_rejected
+                     if request.num_output_placeholders > 0:
+                         request.num_output_placeholders -= num_rejected
+-                spec_decoding_stats = self.make_spec_decoding_stats(
+-                    spec_decoding_stats,
+-                    num_draft_tokens=num_draft_tokens,
+-                    num_accepted_tokens=num_accepted,
+-                    num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
+-                    request_id=req_id,
+-                )
+ 
+             # Free encoder inputs only after the step has actually executed.
+             if request.has_encoder_inputs:
+@@ -1797,18 +1795,139 @@
+             stopped = False
+             new_logprobs = None
+             new_token_ids = generated_token_ids
++            # DSV4 0010: DSpark can surface its draft-buffer sentinel
++            # (id == vocab_size) as a sampled token when a degraded draft
++            # stream meets an empty grammar row. Committing it feeds the id
++            # back into the next forward's embedding lookup -> CUDA
++            # device-side assert -> engine death (2x 2026-08-18). Finish
++            # the request with error and commit nothing (0012 semantics).
++            vocab_size = self.vllm_config.model_config.get_vocab_size()
++            oov_idx = next(
++                (i for i, t in enumerate(new_token_ids) if t >= vocab_size),
++                None,
++            )
++            if oov_idx is not None:
++                logger.warning(
++                    "Out-of-vocab token %s (vocab_size=%s) in output of "
++                    "request %s at position %s of %s; finishing the request "
++                    "with error and committing nothing.",
++                    new_token_ids[oov_idx],
++                    vocab_size,
++                    req_id,
++                    oov_idx,
++                    len(new_token_ids),
++                )
++                # DSV4 0012: do NOT truncate-and-continue. The worker
++                # already committed the full block to input_batch, so a
++                # scheduler-side truncation desyncs the two token histories
++                # and misaligns every later spec window (the drafter anchor
++                # then reads stale buffer slots -> out-of-vocab embedding
++                # assert, 2x 2026-08-18). Dropping the block is only safe
++                # because the request ends here; mirror the stock
++                # grammar-terminate path instead.
++                request.structured_output_request = None
++                new_token_ids = []
++                request.status = RequestStatus.FINISHED_ERROR
++                request.resumable = False
++                stopped = True
+             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
+             kv_transfer_params = None
+             ec_transfer_params = None
+             prefill_stats = None
+             status_before_stop = request.status
+             num_output_tokens_before = len(request._output_token_ids)
++            # DSV4 0013: set when the grammar completes inside this block
++            # (TYPE-A); drives the explicit finish after the commit below.
++            grammar_completed = False
++
++            if (
++                new_token_ids
++                and scheduled_spec_token_ids
++                and request.use_structured_output
++                and not output_is_stale
++            ):
++                # DSV4 0013: validate only -- never truncate a live FSM.
++                # The worker already committed the full block in
++                # _update_states_after_model_execute; a scheduler-side
++                # truncation desyncs the two token histories, misaligns
++                # every later spec window, and the drafter eventually
++                # reads a stale anchor slot: id >= vocab_size -> CUDA
++                # device-side assert on the drafter PP rank (2x 2026-08-18).
++                # Bifurcate by FSM state:
++                #   TYPE-A (FSM terminated in-block): the rejected suffix is
++                #     post-completion garbage. Keep the valid prefix, commit
++                #     it, and finish the request this iteration -- no future
++                #     spec window exists, so the truncation is desync-safe
++                #     (same invariant as the stock stop-truncation). Without
++                #     this, the unconstrained tail corrupted client
++                #     tool-call parsing (dead session 2026-08-18 22:59).
++                #   TYPE-B (FSM still live): keep 0012 salvage -- commit the
++                #     block unchanged and abandon enforcement; counted via
++                #     its distinct log line before any further tightening.
++                _kept, num_grammar_rejected, grammar_terminated = (
++                    self.structured_output_manager.filter_speculative_grammar_tokens(
++                        request, new_token_ids
++                    )
++                )
++                if num_grammar_rejected > 0:
++                    if grammar_terminated:
++                        logger.warning(
++                            "Grammar completed mid-block for request %s "
++                            "(TYPE-A); keeping %s valid tokens, truncating "
++                            "%s post-termination tokens and finishing the "
++                            "request.",
++                            req_id,
++                            len(_kept),
++                            num_grammar_rejected,
++                        )
++                        new_token_ids = _kept
++                        grammar_completed = True
++                        if not new_token_ids:
++                            # Nothing valid to commit (the grammar was
++                            # already complete before this block); finish
++                            # here directly.
++                            request.status = RequestStatus.FINISHED_STOPPED
++                            request.resumable = False
++                            stopped = True
++                    else:
++                        logger.warning(
++                            "Grammar rejected %s of %s speculative tokens "
++                            "for request %s (TYPE-B: FSM still live); "
++                            "abandoning structured-output enforcement and "
++                            "committing the block unchanged.",
++                            num_grammar_rejected,
++                            len(new_token_ids),
++                            req_id,
++                        )
++                        # read-only property: the next line flips use_structured_output
++                        request.structured_output_request = None
++
++            if observed_spec_decode:
++                spec_decoding_stats = self.make_spec_decoding_stats(
++                    spec_decoding_stats,
++                    num_draft_tokens=num_draft_tokens,
++                    num_accepted_tokens=num_accepted,
++                    num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
++                    request_id=req_id,
++                )
+ 
+             # Check for stop and update request status.
+             if new_token_ids:
+                 new_token_ids, stopped = self._update_request_with_output(
+                     request, new_token_ids, is_stale=output_is_stale
+                 )
++                if grammar_completed and not stopped:
++                    # DSV4 0013 TYPE-A finish: the grammar completed at the
++                    # end of the committed prefix. Stock v1 only stops
++                    # masking after termination and decodes unconstrained
++                    # to EOS/max_tokens -- that leak is what 0013 closes.
++                    # Finishing here keeps the emitted output
++                    # schema-valid; the request leaves the running set in
++                    # this iteration, so the truncated worker-side tail is
++                    # never consumed by a later spec window.
++                    request.status = RequestStatus.FINISHED_STOPPED
++                    request.resumable = False
++                    stopped = True
+             elif request.pooling_params and pooler_output is not None:
+                 # Pooling stops as soon as there is output.
+                 request.status = RequestStatus.FINISHED_STOPPED
+@@ -1832,15 +1951,41 @@
+                 if advance_token_ids and not grammar.accept_tokens(
+                     req_id, advance_token_ids
+                 ):
+-                    logger.error(
+-                        "Unexpected: grammar rejected tokens %s for request %s. "
+-                        "Terminating request.",
+-                        advance_token_ids,
+-                        req_id,
+-                    )
+-                    request.status = RequestStatus.FINISHED_ERROR
+-                    request.resumable = False
+-                    stopped = True
++                    if os.environ.get("DSV4_GRAMMAR_SALVAGE", "1") == "0":
++                        logger.error(
++                            "Unexpected: grammar rejected tokens %s for request %s. "
++                            "Terminating request.",
++                            advance_token_ids,
++                            req_id,
++                        )
++                        request.status = RequestStatus.FINISHED_ERROR
++                        request.resumable = False
++                        stopped = True
++                    else:
++                        # DSV4: the Flash checkpoint under long contexts
++                        # intermittently degrades into malformed DSML loops
++                        # (production-verified: rejected tokens decode to
++                        # envelope fragments like '<' + DSML + 'tool_calls'
++                        # repeated, or parameter names with self-invented
++                        # tags). The FSM is right to refuse, but terminating
++                        # the request surfaces as a 500 mid-stream and
++                        # clients retry into the same degradation. Abandon
++                        # enforcement instead and let the request finish
++                        # unconstrained; the deepseek_v4 parser (0007 lenient
++                        # envelope) can still recover a tool call from the
++                        # degraded output. Restore stock behavior with
++                        # DSV4_GRAMMAR_SALVAGE=0.
++                        logger.warning(
++                            "Grammar rejected tokens %s for request %s; "
++                            "abandoning structured-output enforcement "
++                            "(salvage; subsequent tokens may violate the "
++                            "schema).",
++                            advance_token_ids,
++                            req_id,
++                        )
++                        # read-only property; None flips it False and
++                        # exits the bitmask/advance paths (audited None-safe)
++                        request.structured_output_request = None
+ 
+             routed_experts = None
+             if (
+--- a/vllm/v1/structured_output/backend_xgrammar.py
++++ b/vllm/v1/structured_output/backend_xgrammar.py
+@@ -159,9 +159,14 @@
+             return False
+         for token in tokens:
+             if not self.matcher.accept_token(token):
+-                logger.error(
+-                    "Failed to advance FSM for request %s "
+-                    "for tokens %s. Please file an issue.",
++                # Expected under spec decode when reasoning ends mid-window:
++                # drafts made before the grammar engaged may be invalid and
++                # the caller tolerates the rejection (structured_output
++                # advance loop). The FATAL variant is logged by the scheduler
++                # ("Unexpected: grammar rejected tokens ... Terminating"), so
++                # this stays quiet.
++                logger.debug(
++                    "FSM did not advance for request %s on token %s.",
+                     request_id,
+                     token,
+                 )
+@@ -187,6 +192,34 @@
+             self.matcher.rollback(len(accepted_tokens))
+         return accepted_tokens
+ 
++    def validate_tokens_ex(self, tokens: list[int]) -> tuple[list[int], bool]:
++        """Non-advancing probe that also reports FSM termination.
++
++        Like validate_tokens, but stops as soon as the FSM reaches its
++        terminal state and reports whether it did. Tokens past the
++        terminal state are definitionally unconstrained garbage, so the
++        caller can distinguish "grammar completed + trailing garbage"
++        (truncate-and-finish is safe) from a mid-stream violation (FSM
++        still live). Breaking before offering the next token to an
++        already-terminated matcher also avoids the xgrammar C++ warning
++        (grammar_matcher.cc:612).
++        """
++        if self._is_terminated:
++            return [], True
++        accepted_tokens = []
++        terminated = False
++        for token in tokens:
++            if not self.matcher.accept_token(token):
++                break
++            accepted_tokens.append(token)
++            if self.matcher.is_terminated():
++                terminated = True
++                break
++        if len(accepted_tokens) > 0:
++            # Rollback the FSM to the initial state
++            self.matcher.rollback(len(accepted_tokens))
++        return accepted_tokens, terminated
++
+     def rollback(self, num_tokens: int) -> None:
+         self.matcher.rollback(num_tokens)
+         self.num_processed_tokens -= num_tokens
+--- a/vllm/v1/structured_output/__init__.py
++++ b/vllm/v1/structured_output/__init__.py
+@@ -4,7 +4,8 @@
+ import multiprocessing
+ from collections.abc import Iterable, Sequence
+ from concurrent.futures import Future, ThreadPoolExecutor
+-from typing import TYPE_CHECKING
++from copy import copy
++from typing import TYPE_CHECKING, overload
+ 
+ from vllm.config import VllmConfig
+ from vllm.logger import init_logger
+@@ -32,6 +33,34 @@
+ logger = init_logger(__name__)
+ 
+ 
++class _TokenSequenceView(Sequence[int]):
++    """Read-only concatenation that does not copy committed token history."""
++
++    def __init__(self, prefix: Sequence[int], suffix: Sequence[int]) -> None:
++        self.prefix = prefix
++        self.suffix = suffix
++
++    def __len__(self) -> int:
++        return len(self.prefix) + len(self.suffix)
++
++    @overload
++    def __getitem__(self, index: int) -> int: ...
++
++    @overload
++    def __getitem__(self, index: slice) -> list[int]: ...
++
++    def __getitem__(self, index: int | slice) -> int | list[int]:
++        if isinstance(index, slice):
++            return [self[i] for i in range(*index.indices(len(self)))]
++        if index < 0:
++            index += len(self)
++        if index < 0 or index >= len(self):
++            raise IndexError(index)
++        if index < len(self.prefix):
++            return self.prefix[index]
++        return self.suffix[index - len(self.prefix)]
++
++
+ class StructuredOutputManager:
+     """Engine-level manager for structured output requests."""
+ 
+@@ -293,6 +322,7 @@
+ 
+                 state_advancements = 0
+                 post_reasoning_end_in_window = False
++                post_reasoning_prefix_valid = True
+                 req_tokens = scheduled_spec_decode_tokens.get(req_id, ())
+                 for i, token in enumerate(req_tokens):
+                     self._fill_bitmasks(((grammar, cumulative_index, apply_bitmask),))
+@@ -322,7 +352,27 @@
+                             advance_grammar = False
+                             post_reasoning_end_in_window = True
+                     if advance_grammar and not grammar.is_terminated():
+-                        accepted = grammar.accept_tokens(req_id, [token])
++                        if post_reasoning_end_in_window:
++                            # These drafts were produced before the grammar
++                            # became active. Probe without logging an expected
++                            # rejection, then persist only valid transitions.
++                            # Once one draft is rejected, the speculative
++                            # suffix is unreachable and must not be probed
++                            # against a state that omitted that draft.
++                            accepted = post_reasoning_prefix_valid and (
++                                grammar.validate_tokens([token]) == [token]
++                            )
++                            if not accepted:
++                                post_reasoning_prefix_valid = False
++                            elif not grammar.accept_tokens(req_id, [token]):
++                                # Validation is non-advancing. If the same
++                                # transition cannot then be persisted, fail
++                                # closed rather than hiding inconsistent state.
++                                raise AssertionError(
++                                    (token, req_id, scheduled_spec_decode_tokens)
++                                )
++                        else:
++                            accepted = grammar.accept_tokens(req_id, [token])
+                         if accepted:
+                             state_advancements += 1
+                         elif not post_reasoning_end_in_window:
+@@ -485,6 +535,122 @@
+             return new_token_ids
+         return new_token_ids[num_reasoning:]
+ 
++    @staticmethod
++    def _find_reasoning_end_offset(
++        reasoner: "ReasoningParser",
++        prior_token_ids: Sequence[int],
++        new_token_ids: list[int],
++    ) -> int | None:
++        """Return where a reasoning-end marker completes in a sampled block.
++
++        The first parser call keeps reasoning-only blocks at one check. When
++        the block contains a transition, cumulative delta prefixes locate
++        single-token and multi-token markers, including markers that start in
++        ``prior_token_ids`` and finish in ``new_token_ids``.
++
++        Args:
++            reasoner: Request-scoped parser that identifies the transition.
++            prior_token_ids: Tokens committed before the sampled block.
++            new_token_ids: Accepted tokens awaiting commit.
++
++        Returns:
++            The zero-based offset where the marker completes, or ``None`` if
++            the sampled block remains inside reasoning.
++        """
++        complete_tokens = _TokenSequenceView(prior_token_ids, new_token_ids)
++        if not copy(reasoner).is_reasoning_end_streaming(
++            complete_tokens, new_token_ids
++        ):
++            return None
++
++        for offset in range(len(new_token_ids)):
++            delta_ids = new_token_ids[: offset + 1]
++            token_ids = _TokenSequenceView(prior_token_ids, delta_ids)
++            # Streaming parsers may retain request-local transition state.
++            # A probe must not consume that state before the normal commit path.
++            if copy(reasoner).is_reasoning_end_streaming(token_ids, delta_ids):
++                return offset
++
++        # Some parsers report only that the complete block crossed a boundary.
++        # Treating the full block as reasoning avoids exposing an unknown suffix
++        # to the answer grammar.
++        return len(new_token_ids) - 1
++
++    def filter_speculative_grammar_tokens(
++        self,
++        request: "Request",
++        new_token_ids: list[int],
++    ) -> tuple[list[int], int, bool]:
++        """Validate an accepted speculative block before it is committed.
++
++        Grammar masks cover scheduled draft positions, but an accepted block
++        can contain an unconstrained token immediately after a reasoning
++        transition or after the grammar completes. The filter retains the
++        grammar-valid prefix and reports the trailing tokens that must be
++        resampled. ``validate_tokens`` restores the grammar state before
++        returning, so the scheduler's normal commit path remains the only
++        operation that advances the matcher.
++
++        Args:
++            request: Request that owns the grammar and reasoning state.
++            new_token_ids: Accepted tokens awaiting scheduler commit.
++
++        Returns:
++            The tokens that are safe to commit, the rejected suffix length,
++            and whether the grammar reached its terminal state inside the
++            block (0013: distinguishes post-completion garbage tails from
++            mid-stream violations).
++        """
++        if self.vllm_config.speculative_config is None:
++            return new_token_ids, 0, False
++        if len(new_token_ids) < 2 or not request.use_structured_output:
++            return new_token_ids, 0, False
++
++        structured_request = request.structured_output_request
++        if structured_request is None:
++            return new_token_ids, 0, False
++        grammar = structured_request.grammar
++        if not isinstance(grammar, StructuredOutputGrammar):
++            return new_token_ids, 0, False
++
++        reasoner = self._get_reasoner(request)
++        grammar_start = 0
++        if (
++            reasoner is not None
++            and not self.enable_in_reasoning
++            and not structured_request.reasoning_ended
++        ):
++            boundary = self._find_reasoning_end_offset(
++                reasoner,
++                request.all_token_ids,
++                new_token_ids,
++            )
++            if boundary is None:
++                return new_token_ids, 0, False
++            grammar_start = boundary + 1
++
++        grammar_tokens = new_token_ids[grammar_start:]
++        if not grammar_tokens:
++            return new_token_ids, 0, False
++        # DSV4 0013: prefer the extended probe that also reports FSM
++        # termination; backends without it cannot distinguish termination
++        # from live violations, so they report not-terminated and the
++        # scheduler keeps the 0012 salvage semantics.
++        probe = getattr(grammar, "validate_tokens_ex", None)
++        if probe is not None:
++            valid_grammar_tokens, grammar_terminated = probe(grammar_tokens)
++        else:
++            valid_grammar_tokens = grammar.validate_tokens(grammar_tokens)
++            grammar_terminated = False
++        rejected = len(grammar_tokens) - len(valid_grammar_tokens)
++        if rejected == 0:
++            return new_token_ids, 0, grammar_terminated
++        return (
++            new_token_ids[:grammar_start] + valid_grammar_tokens,
++            rejected,
++            grammar_terminated,
++        )
++
+     def clear_backend(self) -> None:
+         if self.backend is not None:
+             self.backend.destroy()
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+@@ -49,6 +49,13 @@
+     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+         super().__init__(vllm_config, device)
+ 
++        # DSV4 0012: clamp bound for drafter anchor ids read from the
++        # persistent input buffer (markov_w1 and the draft embedding have
++        # exactly get_vocab_size() rows).
++        self._anchor_vocab_limit = (
++            vllm_config.model_config.get_vocab_size() - 1
++        )
++
+         # Whether to sample from the anchor position. When True, uses anchor-as-first
+         # (N slots, each position predicts the next token). When False, uses 1+N
+         # fill-in block (anchor is a bonus token).
+@@ -176,6 +183,12 @@
+         # Anchor (bonus) token per request = the input id at query offset 0,
+         # read via the precomputed persistent index (fixed buffer for capture).
+         prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
++        # DSV4 0012: a scheduler/worker history desync can leave an anchor
++        # slot holding stale buffer memory; an id past the vocab is a
++        # device-side assert in markov_w1/draft embedding (eager) or an
++        # unchecked OOB read (fused kernel). Clamp like the fused kernel
++        # bounds its outputs; verification discards the corrupted draft.
++        prev = prev.clamp_(0, self._anchor_vocab_limit)
+ 
+         if self._fused_markov is not None:
+             # Same chain as the loop below, with each step's seven kernels and

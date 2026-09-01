@@ -104,6 +104,43 @@ On `c3046d1`:
   (which only fires inside the rejection sampler) isn't in play. Env-gated, **off by default**
   — set `DSV4_REPETITION_GUARD=1` to enable; see the patch header for all five tuning knobs.
   Applies after `0016` in glob order; touches `vllm/v1/engine/detokenizer.py` only.
+- **`0018`-`0020` (new, 2026-09-01)** — ported from
+  [ChinaBoy0618/deepseek-v4-cmp170hx](https://github.com/ChinaBoy0618/deepseek-v4-cmp170hx), an
+  independent, more mature deployment on the same fork lineage with extensive production soak
+  testing and documented incident postmortems (`docs/issues/`). Their patches `0007`-`0019v2`
+  target the same failure family this repo chased down in `0016`-`0017`, from more production
+  data. Ported with attribution rather than reinvented; see each patch's header for exact
+  provenance and every adaptation made to apply cleanly against our tree.
+  - `0018` — recognizes the `<｜DSML｜_tool_calls>` (leading-underscore) envelope variant the
+    checkpoint occasionally emits instead of the correct wrapper — a different, deterministic
+    parser gap from anything `0009`-`0016` cover. Independently arrived at the same
+    REASONING-state coverage `0016` added for orphan invokes — good cross-validation.
+  - `0019` — survives grammar-constrained decoding failures under DSpark instead of killing the
+    request/worker: FSM rejections abandon enforcement rather than terminating (`tool_calls`
+    still recoverable from the unconstrained tail via `0018`/this repo's own recovery series),
+    speculative blocks are grammar-validated before commit rather than after, DSpark's
+    draft-buffer OOV sentinel is truncated instead of crashing a worker, and the scheduler/worker
+    truncation desync that caused two production `EngineDead` incidents is fixed. Squashes five
+    upstream commits (their `0008`/`0009`/`0010`/`0012`/`0013`), sequential and interdependent —
+    see the patch header for the three adaptations needed against our tree.
+  - `0020` — two more degenerate-generation tripwires, squashed from six of their commits
+    (`0014`/`0015`/`0017`/`0017v2`/`0019`/`0019v2`): a hallucinated-control-tag "soup" detector
+    (streak- and cumulative-total-gated, catches invented pseudo-tags like `<system-reminder>`,
+    `</assistant>`, `<tool_calls` that match neither DSML nor any real protocol — directly
+    matches this repo's own observed `<system-remember>`/`<tool_use><tool_name>` hallucinations),
+    and their exact-line-repeat phrase-lock check (cross-step streak persistence + actual token
+    history truncation, strictly more robust than `0017`'s single-snapshot/no-truncation
+    design). **Merges in a new fuzzy varied-wording detector** (`_dsv4_fuzzy_rep_lines()`,
+    this repo's own addition, not upstream) as a fallback alongside their exact-match check,
+    since their check only catches verbatim-repeated lines and would miss `0017`'s original
+    varied-wording "Let me find/check/search..." case — both loop shapes are real, confirmed on
+    this repo's own served image. A punctuation-stripping bug found and fixed during the merge
+    (see patch header) — first cut silently false-negatived on the exact case it was written
+    for.
+  Applies after `0017` in glob order; `0018` touches `vllm/parser/deepseek_v4.py`, `0019`
+  touches `vllm/v1/core/sched/scheduler.py` + `vllm/v1/structured_output/{__init__,
+  backend_xgrammar}.py` + `vllm/v1/worker/gpu/spec_decode/dspark/speculator.py`, `0020` touches
+  `vllm/v1/core/sched/scheduler.py` only (on top of `0019`'s changes there).
 - ⚠️ **The range touches `csrc/`** (`libtorch_stable/topk.cu` FilteredTopK decode routing —
   one of the real wins — plus `marlin.cu`, `custom_all_reduce.cuh`), so
   `VLLM_USE_PRECOMPILED=1` and the bind-mount method **cannot deliver the kernel changes**.

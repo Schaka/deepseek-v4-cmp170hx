@@ -1,0 +1,107 @@
+From: deepseek-v4-cmp170hx
+Subject: [PATCH 0018] parser: recognize the leading-underscore DSML tool_calls
+ envelope variant (port of ChinaBoy0618/deepseek-v4-cmp170hx's
+ 0007-lenient-dsml-tool-calls, itself on the allover326/deepseek-v4-cmp170hx
+ lineage this fork shares)
+
+WHAT THIS FIXES. Near the context ceiling the Flash checkpoint occasionally
+degrades its tool-call envelope: a well-formed `<｜DSML｜invoke>`/
+`<｜DSML｜parameter>` body wrapped in `<｜DSML｜_tool_calls>` -- note the
+leading underscore -- instead of the correct `<｜DSML｜tool_calls>`. The
+stock parser has no rule for the underscored variant, so it falls through
+to plain content and the whole call leaks as raw protocol text. Upstream's
+own encoding README states parsers do not recover malformed output, so
+this has to be handled here. ChinaBoy0618's fork reports 12 leak events in
+5 minutes at 143k input tokens in production, and a 6-shot replay at 80k
+tokens reproducing the drift once at temp 0.6, never at temp 0 --
+model-side probabilistic drift, not a client or parser bug.
+
+THE FIX. Adds `DSML_TOOL_START_LENIENT`/`DSML_TOOL_END_LENIENT` aliases
+for the underscored envelope and mirrors the four existing
+`TOOL_START`/`TOOL_END` state-machine transitions onto them -- including
+the `(REASONING, TOOL_START_LENIENT)` entry, independently arriving at
+the same REASONING-state coverage `0016` added for orphan invokes (good
+cross-validation of that approach from an unrelated source). Purely
+additive: the lexer is longest-literal-first, so the official
+`tool_calls` envelope is byte-identical: unaffected.
+
+PORT NOTES. Applied with fuzz 2 (offset only, three-line shift) on hunk 1
+against our tree -- this repo's `0009`/`0016` add lines before the same
+region, nothing else differs. Verified: applies clean, compiles, and the
+resulting transition table has the full REASONING/CONTENT x
+TOOL_START/TOOL_END/TOOL_START_LENIENT/TOOL_END_LENIENT matrix expected.
+Applies after `0017` in glob order; touches `vllm/parser/deepseek_v4.py`
+only.
+--- a/vllm/parser/deepseek_v4.py
++++ b/vllm/parser/deepseek_v4.py
+@@ -52,6 +52,15 @@
+ DSML_FOREIGN_TOOL_START = f"<{_DSML}function_calls>"
+ DSML_FOREIGN_TOOL_END = f"</{_DSML}function_calls>"
+ 
++# Lenient envelope variants: the Flash checkpoint occasionally emits a
++# leading underscore in the tool-calls envelope when output degrades in
++# long contexts (observed "<｜DSML｜_tool_calls>" with a
++# well-formed invoke/parameter body inside; the official encoding README
++# states parsers do not recover malformed output). These aliases keep
++# such calls parseable instead of leaking them as plain content.
++DSML_TOOL_START_LENIENT = f"<{_DSML}_tool_calls>"
++DSML_TOOL_END_LENIENT = f"</{_DSML}_tool_calls>"
++
+ _ESCAPED_DSML = re.escape(_DSML)
+ _PARAM_RE = re.compile(
+     rf'<{_ESCAPED_DSML}parameter\s+name="([^"]+)"\s+string="(true|false)">'
+@@ -134,6 +143,8 @@
+             "THINK_END": DSML_THINK_END,
+             "TOOL_START": DSML_TOOL_START,
+             "TOOL_END": DSML_TOOL_END,
++            "TOOL_START_LENIENT": DSML_TOOL_START_LENIENT,
++            "TOOL_END_LENIENT": DSML_TOOL_END_LENIENT,
+             "INVOKE_PREFIX": DSML_INVOKE_PREFIX,
+             "INVOKE_NAME_END": DSML_INVOKE_NAME_END,
+             "INVOKE_END": DSML_INVOKE_END,
+@@ -146,6 +157,8 @@
+             "THINK_END": DSML_THINK_END,
+             "TOOL_START": DSML_TOOL_START,
+             "TOOL_END": DSML_TOOL_END,
++            "TOOL_START_LENIENT": DSML_TOOL_START_LENIENT,
++            "TOOL_END_LENIENT": DSML_TOOL_END_LENIENT,
+         },
+         transitions={
+             (ParserState.CONTENT, "THINK_START"): Transition(
+@@ -216,6 +229,14 @@
+                 ParserState.TOOL_PREAMBLE,
+                 (),
+             ),
++            (ParserState.REASONING, "TOOL_START_LENIENT"): Transition(
++                ParserState.TOOL_PREAMBLE,
++                (EventType.REASONING_END,),
++            ),
++            (ParserState.CONTENT, "TOOL_START_LENIENT"): Transition(
++                ParserState.TOOL_PREAMBLE,
++                (),
++            ),
+             (ParserState.TOOL_PREAMBLE, "INVOKE_PREFIX"): Transition(
+                 ParserState.TOOL_NAME,
+                 (EventType.TOOL_CALL_START,),
+@@ -232,6 +253,10 @@
+                 ParserState.CONTENT,
+                 (EventType.TOOL_CALL_END,),
+             ),
++            (ParserState.TOOL_ARGS, "TOOL_END_LENIENT"): Transition(
++                ParserState.CONTENT,
++                (EventType.TOOL_CALL_END,),
++            ),
+             # Parallel tool calls
+             (ParserState.TOOL_BETWEEN, "INVOKE_PREFIX"): Transition(
+                 ParserState.TOOL_NAME,
+@@ -241,6 +266,10 @@
+                 ParserState.CONTENT,
+                 (),
+             ),
++            (ParserState.TOOL_BETWEEN, "TOOL_END_LENIENT"): Transition(
++                ParserState.CONTENT,
++                (),
++            ),
+         },
+         content_events={
+             ParserState.CONTENT: EventType.TEXT_CHUNK,
