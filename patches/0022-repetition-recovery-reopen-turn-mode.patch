@@ -1,0 +1,200 @@
+From: deepseek-v4-cmp170hx
+Subject: [PATCH 0022] scheduler: add a template-correct "reopen turn"
+ recovery mode alongside 0021's freeform nudge
+
+WHAT THIS FIXES. Live testing of `0021` past ~100k context found the
+nudge splice fires as designed (confirmed via logs: "spliced a recovery
+nudge (attempt 1/2)", then "attempt 2/2") but the model keeps mutating
+into new short repeats even after taking the nudge ("Let me check" ->
+"Check the run" -> "Check."), burning the whole `DSV4_NUDGE_MAX_RETRIES`
+budget without actually recovering -- worse than the ~100k-and-under
+case this mechanism was validated against.
+
+Two independent findings point at the same suspect. First,
+ggml-org/llama.cpp#26694 reports the identical shape -- repetition loops
+in long agentic chats (large system prompt + tool schemas + format-heavy
+markup) that reproduce locally but not against the official DeepSeek
+API, with thinking-mode toggling and temperature ruled out; the reporter
+suspects "chat-template / stop-token handling" losing track of turn
+boundaries deep in an extended agentic context. Second, `0021`'s own
+nudge is freeform text spliced mid-turn with NO template boundary at
+all -- it's appended into the same raw token stream the loop was already
+degenerating in, so if the boundary-tracking state itself is what's
+corrupted, a plain-text nudge never touches the actual problem.
+
+THE MECHANISM. `_dsv4_reopen_turn()` splices the exact turn-boundary
+token sequence a genuine new `/v1/chat/completions` call would produce
+for a fresh user turn saying "go", instead of freeform text: close the
+current (truncated) assistant turn with the eos token, open a user turn,
+open the next assistant turn. This is not a guess at the format -- it's
+read directly from vllm/tokenizers/deepseek_v4_encoding.py:
+`assistant_msg_template = "{reasoning}{content}{tool_calls}" + eos_token`
+followed immediately by `USER_SP_TOKEN` / user content / `ASSISTANT_SP_TOKEN`
+in `render_message()`'s user-role branch. Splicing this (rather than
+literally ending the stream and letting the client re-open a new HTTP
+request) keeps the recovery server-side and same-turn like `0021`, but
+gives the model a real, unambiguous, freshly-tokenized turn boundary
+to reset against instead of asking it to recover from inside the same
+corrupted-boundary context.
+
+Same non-advancing-num_computed_tokens splice shape as `0021`'s
+`_dsv4_splice_nudge()` -- see that function's docstring for why forcing
+a real forward pass over the spliced tokens (rather than treating them
+as already-computed) is safe. Shares `_dsv4_nudge_count` /
+`DSV4_NUDGE_MAX_RETRIES` with the nudge path -- the two strategies are
+mutually exclusive per request, chosen once via `DSV4_RECOVERY_MODE`
+(default "nudge", opt-in "reopen"), never mixed mid-request.
+
+`_dsv4_recover()` is a thin dispatcher: both tripwire call sites in
+`0020`/`0021` now go through it instead of calling `_dsv4_splice_nudge()`
+directly, so switching strategies is a single env var
+(`DSV4_RECOVERY_MODE=reopen`), not a code change. `DSV4_NUDGE=0` still
+disables recovery entirely regardless of mode, same as before.
+
+STATUS: untested. This is the "b" experiment in a planned A/B --
+`top_p=0.95` + `--reasoning-parser deepseek_v4` is being tried first
+against the same >100k-context repro; this patch is staged so the
+reopen-mode retest can follow immediately without a rebuild delay if
+the sampling-side fix alone doesn't hold.
+
+Touches `vllm/v1/core/sched/scheduler.py` only, on top of `0021` in the
+same file. Applies after `0021` in glob order.
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -196,6 +196,29 @@
+             "\n\nStop repeating yourself. Make the tool call now.\n\n",
+         )
+         self._dsv4_nudge_max = int(os.environ.get("DSV4_NUDGE_MAX_RETRIES", "2"))
++        # DSV4 0022: alternate recovery strategy. 0021's nudge splices
++        # freeform text mid-turn, with no template-boundary reset -- live
++        # testing past ~100k context found the model can keep mutating
++        # into new short repeats even after a nudge fires (e.g. "Let me
++        # check" -> "Check the run" -> "Check."), consuming the whole
++        # retry budget without recovering. "reopen" instead splices the
++        # SAME turn-boundary sequence a genuine new API call would
++        # produce for a fresh user turn saying "go" -- close the
++        # assistant turn (eos), open a user turn, open the next
++        # assistant turn -- exactly as vllm/tokenizers/
++        # deepseek_v4_encoding.py's assistant_msg_template / render_message
++        # render it. Still spliced into the SAME request/KV-cache (no
++        # actual round trip), but with a template-correct boundary
++        # instead of raw text, in case the loop is caused by the model
++        # losing track of turn boundaries in extended agentic context
++        # (matches ggml-org/llama.cpp#26694's local-only, long-agentic-
++        # chat, template/stop-token-boundary suspicion). Opt-in and
++        # untested pending a real run: DSV4_RECOVERY_MODE=reopen.
++        self._dsv4_recovery_mode = os.environ.get("DSV4_RECOVERY_MODE", "nudge")
++        self._dsv4_reopen_text = os.environ.get(
++            "DSV4_REOPEN_TEXT",
++            "<｜end▁of▁sentence｜><｜User｜>go<｜Assistant｜>",
++        )
+
+         # include_finished_set controls whether a separate set of finished
+         # request ids should be included in the EngineCoreOutputs returned
+@@ -2540,6 +2563,66 @@
+             request._dsv4_soup_streaks.clear()
+         return True
+
++    def _dsv4_reopen_turn(self, request: Request) -> bool:
++        """DSV4 0022: alternate recovery strategy to _dsv4_splice_nudge().
++
++        0021's nudge splices freeform text mid-turn -- no template
++        boundary, same raw token stream the loop was already in. Live
++        testing past ~100k context found the model can take the nudge
++        and still keep mutating into new short repeats ("Let me check"
++        -> "Check the run" -> "Check.") rather than actually recovering,
++        burning the whole retry budget. This splices the exact
++        turn-boundary token sequence a genuine new chat completion would
++        produce for a fresh user turn saying "go" instead: close the
++        current (truncated) assistant turn with eos, open a user turn,
++        open the next assistant turn -- see assistant_msg_template /
++        USER_SP_TOKEN / ASSISTANT_SP_TOKEN in
++        vllm/tokenizers/deepseek_v4_encoding.py, which this mirrors. The
++        eos/User/Assistant strings must be recognized as this
++        tokenizer's own special tokens for encode() to resolve them to
++        the right ids rather than falling back to literal byte tokens --
++        true for the stock deepseek_v4 vocab, but if a future tokenizer
++        swap ever stops treating them as added/special tokens, this
++        silently degrades to nudge's regime (freeform text spliced with
++        no real boundary) rather than raising, so double check with
++        DSV4_RECOVERY_MODE=reopen's warning log line if in doubt.
++
++        Same splice-without-advancing-num_computed_tokens mechanism as
++        _dsv4_splice_nudge() -- see there for why that's safe. Shares
++        _dsv4_nudge_count / DSV4_NUDGE_MAX_RETRIES with the nudge path;
++        the two are mutually exclusive per request (selected once via
++        DSV4_RECOVERY_MODE, not mixed mid-request).
++        """
++        _tok = getattr(self.structured_output_manager, "tokenizer", None)
++        if _tok is None:
++            return False
++        _count = getattr(request, "_dsv4_nudge_count", 0)
++        if _count >= self._dsv4_nudge_max:
++            return False
++        reopen_ids = _tok.encode(self._dsv4_reopen_text, add_special_tokens=False)
++        if not reopen_ids:
++            return False
++        request._output_token_ids.extend(reopen_ids)
++        request._all_token_ids.extend(reopen_ids)
++        request._dsv4_nudge_count = _count + 1
++        request._dsv4_rep_streak = 0
++        if getattr(request, "_dsv4_soup_streaks", None):
++            request._dsv4_soup_streaks.clear()
++        return True
++
++    def _dsv4_recover(self, request: Request) -> bool:
++        """DSV4 0022: dispatch to the configured recovery strategy
++        (DSV4_RECOVERY_MODE: "nudge" [default] or "reopen"). See
++        _dsv4_splice_nudge() and _dsv4_reopen_turn() respectively.
++        DSV4_NUDGE=0 disables recovery entirely regardless of mode,
++        reverting to 0020's finish-on-fire behavior (pre-0021).
++        """
++        if not self._dsv4_nudge_enabled:
++            return False
++        if self._dsv4_recovery_mode == "reopen":
++            return self._dsv4_reopen_turn(request)
++        return self._dsv4_splice_nudge(request)
++
+     def _dsv4_rep_lines(self, request: Request, new_token_ids) -> "str | None":
+         """DSV4 0019: the short line repeated >=5x in this block's decode
+         window, or None. Char-length prefilter (<=28) keeps the encode
+@@ -2730,16 +2813,17 @@
+                         request.num_computed_tokens = max(
+                             0, request.num_computed_tokens - _removed
+                         )
+-                if self._dsv4_splice_nudge(request):
++                if self._dsv4_recover(request):
+                     logger.warning(
+                         "DSV4 0015 soup-tripwire for request %s: signature "
+                         "%r streak %s total %s, trimmed %s tokens, "
+-                        "spliced a recovery nudge (attempt %s/%s).",
++                        "spliced a recovery %s (attempt %s/%s).",
+                         request.request_id,
+                         _fired,
+                         _streaks[_fired],
+                         _totals.get(_fired, 0),
+                         _removed,
++                        self._dsv4_recovery_mode,
+                         request._dsv4_nudge_count,
+                         self._dsv4_nudge_max,
+                     )
+@@ -2780,16 +2864,17 @@
+                         request.num_computed_tokens = max(
+                             0, request.num_computed_tokens - _removed
+                         )
+-                if self._dsv4_splice_nudge(request):
++                if self._dsv4_recover(request):
+                     logger.warning(
+                         "DSV4 0019 rep-tripwire for request %s: line %r "
+                         "repeated %s consecutive blocks, dropped %s "
+-                        "tokens, spliced a recovery nudge (attempt "
++                        "tokens, spliced a recovery %s (attempt "
+                         "%s/%s).",
+                         request.request_id,
+                         _rep,
+                         _rs,
+                         _removed,
++                        self._dsv4_recovery_mode,
+                         request._dsv4_nudge_count,
+                         self._dsv4_nudge_max,
+                     )
