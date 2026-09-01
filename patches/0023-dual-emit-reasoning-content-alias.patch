@@ -1,0 +1,89 @@
+From: deepseek-v4-cmp170hx
+Subject: [PATCH 0023] api: also emit reasoning_content alongside reasoning
+ in chat completion responses
+
+WHAT THIS FIXES. This fork's OpenAI-compatible response schema renames
+the field carrying reasoning text to `reasoning` (see the comment at
+`ChatCompletionRequest.to_sampling_params` in
+vllm/entrypoints/openai/chat_completion/protocol.py: "Renames the
+deprecated `reasoning_content` field to `reasoning` so downstream code
+only needs to check one field.") -- `reasoning_content` is handled only
+as a legacy *input* alias for messages fed back into a request, never as
+an output field name.
+
+That's an intentional internal convention, not a bug -- but it's a real
+compatibility gap against the wider ecosystem. DeepSeek's own official
+API, and most other reasoning-model providers, use `reasoning_content`
+as the field name clients actually look for. A client built against that
+convention and never taught about `reasoning` would not recognize any of
+this server's reasoning output as reasoning at all.
+
+Symptom this is suspected of causing (not yet confirmed via packet
+capture): opencode showing an entire `<think>` block as plain assistant
+output instead of routing it to a separate reasoning/thinking UI
+section, and a tool call the model emits while still inside that block
+never being recognized as a real tool call client-side. If the
+misrouted reasoning text also gets folded into `content` and sent back
+as conversation history on the client's next request, the server's own
+chat template -- which is specifically supposed to drop stale thinking
+content from prior turns -- has no way to know that text was reasoning,
+since nothing marks it as such once it's been merged into `content`.
+That could compound across a whole session, not just misdisplay one
+turn.
+
+THE FIX. Both `ChatMessage` (non-streaming) and `DeltaMessage`
+(streaming) already have an identical `@model_serializer(mode="wrap")`
+method that runs at serialization time, right before the response goes
+out over the wire. Extending both to also copy `reasoning` into
+`reasoning_content` in the outgoing dict, when set, covers every current
+and future call site that constructs one of these objects (six in
+`chat_completion/serving.py`, one in `chat_completion/batch_serving.py`,
+plus wherever the streaming reasoning parser's `parse_delta` builds a
+`DeltaMessage` directly) without needing to touch any of them
+individually. Purely additive: `reasoning` is untouched, `content` is
+untouched, `reasoning_content` only ever gets added, never overwrites an
+existing key.
+
+Does not touch request-side parsing at all -- `reasoning_content` as an
+input alias (line ~514 of the same file, for messages fed back in) was
+already handled before this patch and is unrelated to this change.
+
+Touches `vllm/entrypoints/openai/chat_completion/protocol.py`
+(ChatMessage) and `vllm/entrypoints/openai/engine/protocol.py`
+(DeltaMessage). No interaction with any other patch in this series --
+different files, additive-only change.
+--- a/vllm/entrypoints/openai/chat_completion/protocol.py
++++ b/vllm/entrypoints/openai/chat_completion/protocol.py
+@@ -69,6 +69,16 @@
+         data = handler(self)
+         if len(data.get("tool_calls", [])) == 0:
+             data.pop("tool_calls", None)
++        if data.get("reasoning") is not None:
++            # DSV4: also emit the widely-adopted ``reasoning_content`` name
++            # (DeepSeek's own official API, most other reasoning-model
++            # providers) alongside this fork's ``reasoning``. A client that
++            # only looks for ``reasoning_content`` -- suspected of opencode,
++            # not yet confirmed via capture -- would otherwise never
++            # recognize the field at all, and could end up folding reasoning
++            # text into `content` on its end instead, which then comes back
++            # corrupted on the next turn.
++            data["reasoning_content"] = data["reasoning"]
+         return data
+ 
+ 
+--- a/vllm/entrypoints/openai/engine/protocol.py
++++ b/vllm/entrypoints/openai/engine/protocol.py
+@@ -402,6 +402,13 @@
+         data = handler(self)
+         if len(data.get("tool_calls", [])) == 0:
+             data.pop("tool_calls", None)
++        if data.get("reasoning") is not None:
++            # DSV4: mirror ChatMessage's reasoning_content alias -- see the
++            # comment there. Streaming deltas need this too, since a client
++            # that only checks reasoning_content per-chunk (not just on the
++            # final assembled message) would otherwise drop reasoning text
++            # from every streamed chunk, not just the non-streaming case.
++            data["reasoning_content"] = data["reasoning"]
+         return data
+ 
+ 
