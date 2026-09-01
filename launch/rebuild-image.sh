@@ -78,7 +78,17 @@ rsync -a "$BASE_DIR/" "$CHECK_DIR/"
 cd "$CHECK_DIR"
 CHANGED_PY=""
 for p in "$CTX_DIR"/patches/*.patch; do
-  files=$(patch -p1 --forward < "$p" | grep '^patching file' | awk '{print $3}')
+  # NOTE: don't pipe `patch`'s own stdout through grep here -- a failed
+  # hunk's diagnostic text only goes to stdout, and grep filtering for
+  # "^patching file" silently discards it, so `set -e`/pipefail abort
+  # the whole script with ZERO error output. Capture full output, check
+  # patch's exit code explicitly, and print everything if it failed.
+  out=$(patch -p1 --forward < "$p" 2>&1) || {
+    echo "FAILED: $(basename "$p")" >&2
+    echo "$out" >&2
+    exit 1
+  }
+  files=$(echo "$out" | grep '^patching file' | awk '{print $3}')
   CHANGED_PY="$CHANGED_PY $files"
 done
 for f in $CHANGED_PY; do
