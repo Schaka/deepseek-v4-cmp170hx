@@ -1,0 +1,165 @@
+From: deepseek-v4-cmp170hx
+Subject: [PATCH 0016] parser: recover orphan DSML invokes from inside
+ <think> too, not just from CONTENT
+
+WHAT BREAKS. `0009`'s orphan-invoke recovery (port of vllm-project/vllm#49117)
+only wires the (CONTENT, INVOKE_PREFIX) and (CONTENT, FOREIGN_START)
+transitions. DeepSeek-V4-0731 defaults to starting every turn already in
+REASONING state -- no explicit opening `<think>` tag, per `0008`'s
+"omitted thinking/enable_thinking means thinking=True" default, which
+just flips the *default* of a thinking->initial_state mapping that
+already existed upstream before `0008` touched it. So on this tree, and
+on any stock vLLM + #49117 caller that explicitly passes `thinking=True`
+(a normal, documented way to call this parser -- nothing fork-specific),
+an orphan invoke emitted before `</think>` never reaches CONTENT at all.
+The whole block -- and, in the non-streaming path, everything scanned
+after it -- gets folded into REASONING_CHUNK and is either lost or
+surfaces as raw DSML text, which is exactly the garbled
+`</parameter></｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>`
+leak this patch was written to reproduce and fix.
+
+CONFIRMED VIA THE PORTED PR #49117 TEST SUITE. Applying that suite's own
+tests (`tests/parser/engine/test_deepseek_v4.py`) against this tree,
+`TestMissingToolStart`/`TestOrphanInvokeNameValidation` fail wholesale
+(38/41) -- not because recovery is subtly wrong, but because every test
+in that suite constructs `DeepSeekV4Parser(mock_tokenizer, tools=[...])`
+without pinning `thinking`, which upstream defaults to CONTENT-initial
+but `0008` defaults to REASONING-initial on this tree. Tracing a single
+case (`tests/parser/engine/parser_engine.py:_on_terminal`) confirms the
+INVOKE_PREFIX terminal is scanned correctly but has no
+`(REASONING, "INVOKE_PREFIX")` entry in the transition table, so it falls
+through to plain REASONING_CHUNK content. Forcing `thinking=False`
+confirms the CONTENT-state path itself is unaffected -- this is purely a
+missing REASONING-state mirror, not a regression in `0009`.
+
+THE FIX. Add `(REASONING, "INVOKE_PREFIX")` and `(REASONING,
+"FOREIGN_START")` transitions mirroring `0009`'s CONTENT-state ones
+exactly, additionally emitting `REASONING_END` (matching the existing
+`(REASONING, "TOOL_START")` transition's pattern for the wrapped-call
+case). Purely additive -- CONTENT-state behavior is untouched.
+
+Also adds a REASONING-state regression suite
+(`TestReasoningStateOrphanInvoke`) covering non-streaming, streaming
+char-by-char, the true production default (no `thinking` kwarg at all),
+and the undeclared-name guard, mirroring the existing CONTENT-state
+coverage from `0009`/the gist series (`0010`-`0015`).
+
+UPSTREAM. This gap is in vllm-project/vllm#49117 itself, not introduced
+by combining our patches -- rasatpetabit's gist (`0010`-`0015`) is built
+directly on #49117's baseline with zero fuzz, so it inherits the same
+gap. Worth reporting upstream on #49117 independent of this port.
+--- a/vllm/parser/deepseek_v4.py
++++ b/vllm/parser/deepseek_v4.py
+@@ -191,6 +191,20 @@
+                 ParserState.FOREIGN_BLOCK,
+                 (EventType.TEXT_CHUNK,),
+             ),
++            # Same recovery, reached while still inside <think>: DSv4-0731
++            # defaults to starting a turn already in REASONING state (no
++            # explicit opening tag), so an orphan invoke emitted before
++            # </think> never reaches CONTENT at all and must be handled
++            # here too, not just from CONTENT.
++            (ParserState.REASONING, "INVOKE_PREFIX"): Transition(
++                ParserState.TOOL_NAME,
++                (EventType.REASONING_END, EventType.TOOL_CALL_START),
++                validate_tool_name=True,
++            ),
++            (ParserState.REASONING, "FOREIGN_START"): Transition(
++                ParserState.FOREIGN_BLOCK,
++                (EventType.REASONING_END, EventType.TEXT_CHUNK),
++            ),
+             (ParserState.FOREIGN_BLOCK, "FOREIGN_END"): Transition(
+                 ParserState.CONTENT,
+                 (EventType.TEXT_CHUNK,),
+--- a/tests/parser/engine/test_deepseek_v4.py
++++ b/tests/parser/engine/test_deepseek_v4.py
+@@ -1769,3 +1769,89 @@
+         assert eos_text not in output.reasoning
+         assert output.content == ""
+         assert output.tool_calls == []
++
++
++# ── Orphan invoke recovered from inside REASONING, not just CONTENT ─────
++
++
++class TestReasoningStateOrphanInvoke:
++    """Orphan invoke recovery must also work while still inside <think>.
++
++    DeepSeek-V4-0731 defaults to starting a turn already in REASONING
++    state (no explicit opening tag -- see the ``thinking`` default in
++    ``DeepSeekV4Parser.__init__``), so a request that never sees an
++    explicit ``thinking=False`` runs the recovery path introduced for
++    TestMissingToolStart / TestOrphanInvokeNameValidation from REASONING,
++    not CONTENT. Those tests all construct the parser without pinning
++    ``thinking``, so on this tree they exercise REASONING already; this
++    class pins it explicitly so the intent is not accidental, and adds
++    the streaming char-by-char case those already cover for CONTENT.
++    """
++
++    @pytest.fixture
++    def weather_tool(self):
++        return _make_tool("get_weather", {"location": {"type": "string"}})
++
++    def _reasoning_parser(self, mock_tokenizer, mock_request, *tools):
++        parser = DeepSeekV4Parser(
++            mock_tokenizer,
++            tools=list(tools),
++            chat_template_kwargs={"thinking": True},
++        )
++        mock_request.tools = list(tools)
++        mock_request.tool_choice = None
++        return parser
++
++    def test_non_streaming_orphan_invoke_from_reasoning(
++        self, mock_tokenizer, mock_request, weather_tool
++    ):
++        parser = self._reasoning_parser(mock_tokenizer, mock_request, weather_tool)
++        text = _invoke("get_weather", ("location", "true", "NYC")) + DSML_TOOL_END
++        result = parser.extract_tool_calls(text, mock_request)
++
++        assert result.tools_called is True
++        assert len(result.tool_calls) == 1
++        assert result.tool_calls[0].function.name == "get_weather"
++        args = json.loads(result.tool_calls[0].function.arguments)
++        assert args == {"location": "NYC"}
++
++    def test_default_thinking_matches_explicit_reasoning(
++        self, mock_tokenizer, mock_request, weather_tool
++    ):
++        """No ``thinking`` kwarg at all must behave the same as pinning it,
++        since that is the real request shape in production."""
++        parser = DeepSeekV4Parser(mock_tokenizer, tools=[weather_tool])
++        mock_request.tools = [weather_tool]
++        mock_request.tool_choice = None
++        text = _invoke("get_weather", ("location", "true", "NYC")) + DSML_TOOL_END
++
++        result = parser.extract_tool_calls(text, mock_request)
++
++        assert result.tools_called is True
++        assert len(result.tool_calls) == 1
++
++    def test_streaming_orphan_invoke_char_by_char_from_reasoning(
++        self, mock_tokenizer, mock_request, weather_tool
++    ):
++        parser = self._reasoning_parser(mock_tokenizer, mock_request, weather_tool)
++        text = _invoke("get_weather", ("location", "true", "NYC")) + DSML_TOOL_END
++        results = simulate_tool_streaming(parser, mock_request, list(text))
++
++        assert collect_function_name(results) == "get_weather"
++        args = collect_tool_arguments(results)
++        assert json.loads(args) == {"location": "NYC"}
++
++    def test_undeclared_name_stays_reasoning_content(
++        self, mock_tokenizer, mock_request, weather_tool
++    ):
++        """Prose quoting the marker inside <think> for an undeclared tool
++        must not be recovered as a call, mirroring the CONTENT-state
++        guard from TestOrphanInvokeNameValidation."""
++        parser = self._reasoning_parser(mock_tokenizer, mock_request, weather_tool)
++        text = (
++            _invoke("get_nothing", ("location", "true", "NYC"))
++            + DSML_THINK_END
++        )
++        result = parser.extract_tool_calls(text, mock_request)
++
++        assert result.tools_called is False

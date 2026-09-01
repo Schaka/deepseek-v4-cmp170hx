@@ -74,6 +74,20 @@ On `c3046d1`:
     tightens `"required"` parsing to accept only a list of strings, all-or-nothing.
   Each patch found by the prior one's own adversarial review round (per patch, see its header);
   applies after `0009` in glob order.
+- **`0016` (new, 2026-09-01)** — orphan-invoke recovery (`0009`) only wires the
+  `(CONTENT, INVOKE_PREFIX)`/`(CONTENT, FOREIGN_START)` transitions. DeepSeek-V4-0731 defaults to
+  starting every turn already in `REASONING` state (no explicit opening `<think>` tag — see
+  `0008`'s thinking default), so an orphan invoke emitted before `</think>` never reaches
+  `CONTENT` and leaks as raw DSML text or is silently dropped — reproduced live on this repo's
+  own served image. Confirmed by running PR #49117's own test suite against this tree: 38/41
+  orphan-recovery tests fail, all because the suite constructs the parser without pinning
+  `thinking` (upstream defaults that to `CONTENT`-initial; `0008` defaults it to
+  `REASONING`-initial here). Fix mirrors `0009`'s CONTENT-state transitions for `REASONING`,
+  additionally emitting `REASONING_END` (matching the existing `(REASONING, "TOOL_START")`
+  pattern). This gap is in PR #49117 itself, not something introduced by combining patches —
+  the gist (`0010`-`0015`) is built directly on #49117's baseline with zero fuzz and inherits
+  it too. Adds a `TestReasoningStateOrphanInvoke` regression suite. Applies after `0015` in
+  glob order; touches `vllm/parser/deepseek_v4.py` only.
 - ⚠️ **The range touches `csrc/`** (`libtorch_stable/topk.cu` FilteredTopK decode routing —
   one of the real wins — plus `marlin.cu`, `custom_all_reduce.cuh`), so
   `VLLM_USE_PRECOMPILED=1` and the bind-mount method **cannot deliver the kernel changes**.
