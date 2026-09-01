@@ -23,6 +23,20 @@ On `c3046d1`:
   for the full investigation (35–65% corruption without the guard, 56/56 clean structured tool
   calls including streaming with it, on 2× 8-GPU A800 TP=4+EP). Applies after `0006` in glob
   order; touches a file no other patch modifies.
+- **`0008` (new, 2026-09-01)** — DeepSeek-V4-0731 thinking/effort defaults, parser mode sync,
+  and a tile-local argmax vocab-size clamp. Adapted from
+  [haosdent/vllm#21](https://github.com/haosdent/vllm/pull/21) (draft, AI-assisted, unmerged —
+  content verified line-by-line against this base rather than cherry-picked; see the patch
+  header for the full provenance chain). Targets the DSv4-Flash-0731 "Let me..." phrase-lock:
+  omitted `thinking`/`enable_thinking` was rendering chat-mode prompts against a model that
+  expects thinking-by-default, and the parser's default state disagreed with the template even
+  when it got thinking mode right — reasoning leaked into content and poisoned long agentic
+  histories. Separately clamps three tile-local `argmax` sites
+  (`vllm/v1/worker/gpu/sample/gumbel.py`,
+  `spec_decode/rejection_sampler_utils.py::_compute_local_logits_stats_kernel` and
+  `_resample_kernel`) to `vocab_size - 1` — an out-of-vocab tile-local argmax otherwise reaches
+  DeepSeek-V4's hash-MoE router and faults every rank. Distinct kernels from `0007`'s NaN guard
+  (no overlap); applies after `0007` in glob order.
 - ⚠️ **The range touches `csrc/`** (`libtorch_stable/topk.cu` FilteredTopK decode routing —
   one of the real wins — plus `marlin.cu`, `custom_all_reduce.cuh`), so
   `VLLM_USE_PRECOMPILED=1` and the bind-mount method **cannot deliver the kernel changes**.

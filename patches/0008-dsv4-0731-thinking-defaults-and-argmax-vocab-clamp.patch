@@ -1,0 +1,241 @@
+From: deepseek-v4-cmp170hx
+Subject: [PATCH 0008] DeepSeek-V4-0731 thinking/effort defaults, parser mode
+ sync, and tile-local argmax vocab clamp
+ (port of haosdent/vllm#21, adapted to the c3046d1 base)
+
+WHAT THIS FIXES. The DeepSeek-V4-Flash-0731 hosted-model contract expects
+omitted thinking/enable_thinking to mean THINKING, not chat. On this tree
+(as on the pre-#21 dsv4-flash-a100 branch) it means chat, and every
+reasoning_effort other than "max"/"xhigh" silently collapses to the "high"
+prefix with no low/minimal/medium distinction. A request that omits
+thinking/enable_thinking therefore renders a generation prompt that ends
+`</think>` instead of `<think>`. In agentic histories this desyncs the
+parser (below) and is one driver of the "Let me..." phrase-lock loop: the
+model repeats a stock reasoning opener because the prompt told it, via the
+missing prefix, that it is not supposed to be thinking at all, then the
+loop reinforces itself over subsequent turns.
+
+Three independent changes, in provenance order:
+
+1. `vllm/tokenizers/deepseek_v4.py`, `vllm/tokenizers/deepseek_v4_encoding.py`
+   -- omitted thinking/enable_thinking now means thinking=True (matching the
+   0731 template contract); reasoning_effort gains a real low/high/max
+   three-way instead of collapsing everything but max/xhigh into "high".
+   Port of vllm-project/vllm#50580 (merged upstream 2026-08-04).
+
+2. `vllm/parser/deepseek_v4.py` -- `DeepSeekV4Parser.__init__` mirrors the
+   same "omitted means thinking" default. Without this, a request with no
+   thinking kwarg renders a thinking-mode prompt (change 1) but the parser
+   still initializes its state machine in CONTENT, so the model's reasoning
+   between the omitted `<think>`/`</think>` streams out as user-visible
+   content instead of being suppressed -- which is what actually poisons the
+   conversation history over long agentic contexts and degrades DSML
+   tool-call emission on later turns.
+
+3. `vllm/v1/worker/gpu/sample/gumbel.py`,
+   `vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py` -- clamp the
+   tile-local argmax to `vocab_size - 1` at three sites
+   (`_gumbel_sample_kernel`, `_compute_local_logits_stats_kernel`,
+   `_resample_kernel`). Each reduces over a BLOCK_SIZE-wide tile and forms
+   `token_id = block_idx * BLOCK_SIZE + idx`; the out-of-vocab tail lanes of
+   the last tile are loaded as -inf, so a degenerate all-(-inf/NaN) tile can
+   settle the reduction on a tail lane and produce `token_id >= vocab_size`.
+   Nothing downstream bounds a sampled token id, and DeepSeek-V4's hash-MoE
+   router indexes `tid2eid[token_id * topk]` directly -- an out-of-range id
+   reads past the table and faults every rank. Distinct bug from 0007 (which
+   guards NaN rows feeding `tl.argmax` in a different pair of kernels,
+   `_compute_global_target_argmax` and `_insert_resampled_kernel`); this
+   clamp is unconditionally safe on its own, since an in-vocab argmax is
+   unaffected and only an index already outside the vocabulary changes.
+   Port of vllm-project/vllm#50843 (upstream PR, open at port time).
+
+PROVENANCE AND WHY THIS IS ADAPTED RATHER THAN CHERRY-PICKED. Upstream PR
+haosdent/vllm#21 bundles these three commits against the current tip of
+dsv4-flash-a100, which has continued past the c3046d1 rebase point this
+patch series pins. File line numbers there do not match this tree, but a
+byte-for-byte diff of every touched region against our c3046d1 checkout
+shows the surrounding code is identical -- only line offsets differ from
+unrelated commits landing in between. This patch carries the same logic
+renumbered for c3046d1, plus this rationale. haosdent/vllm#21 itself is
+still in draft (marked "AI-assisted -- human review required" with an
+unchecked review checklist) and change 1 traces to a third-party backport
+(wtdcode/vllm-backport), not vllm-project directly -- treat the reasoning
+above, not that PR's description, as the record of what was actually
+verified before landing here.
+
+Applies after 0007 in glob order; touches
+`v1/worker/gpu/spec_decode/rejection_sampler_utils.py` at different
+functions than 0007 (no overlap) plus four files no other patch modifies.
+
+--- a/vllm/tokenizers/deepseek_v4.py
++++ b/vllm/tokenizers/deepseek_v4.py
+@@ -26,10 +26,12 @@ def apply_chat_template(
+             tools: list[dict[str, Any]] | None = None,
+             **kwargs,
+         ) -> str | list[int]:
+-            thinking = kwargs.get("thinking", False)
+-            enable_thinking = kwargs.get("enable_thinking", False)
+-            thinking = thinking or enable_thinking
+-            thinking_mode = "thinking" if thinking else "chat"
++            thinking = kwargs.get("thinking")
++            enable_thinking = kwargs.get("enable_thinking")
++            thinking_enabled = bool(thinking) or bool(enable_thinking)
++            if "thinking" not in kwargs and "enable_thinking" not in kwargs:
++                thinking_enabled = True
++            thinking_mode = "thinking" if thinking_enabled else "chat"
+
+             conversation = kwargs.get("conversation", messages)
+             messages = conversation.copy()
+@@ -39,12 +41,14 @@ def apply_chat_template(
+
+             reasoning_effort = kwargs.get("reasoning_effort")
+             if not isinstance(reasoning_effort, str):
+-                reasoning_effort = None
++                reasoning_effort = "high" if thinking_enabled else None
+             elif reasoning_effort == "none":
+                 thinking_mode = "chat"
+                 reasoning_effort = None
+-            elif reasoning_effort in ("max", "xhigh"):
++            elif reasoning_effort == "max":
+                 reasoning_effort = "max"
++            elif reasoning_effort in ("low", "minimal", "medium"):
++                reasoning_effort = "low"
+             else:
+                 reasoning_effort = "high"
+
+--- a/vllm/tokenizers/deepseek_v4_encoding.py
++++ b/vllm/tokenizers/deepseek_v4_encoding.py
+@@ -62,11 +62,20 @@
+     "<tool_result>{content}</tool_result>"
+ )
+
+-REASONING_EFFORT_MAX = (
+-    "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
+-    "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n"
+-    "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n"
+-)
++REASONING_EFFORT_PROMPTS: Dict[str, str] = {
++    "low": "",
++    "high": (
++        "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
++        "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n"
++        "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n"
++    ),
++    "max": (
++        "Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\n"
++        "You MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\n"
++        "Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n"
++    ),
++}
++DEFAULT_REASONING_EFFORT = "low"
+
+ TOOLS_TEMPLATE = """## Tools
+
+@@ -199,7 +208,8 @@ def render_message(index: int, messages: List[Dict[str, Any]], thinking_mode: st
+         messages: Full list of messages in the conversation.
+         thinking_mode: Either "chat" or "thinking".
+         drop_thinking: Whether to drop reasoning content from earlier turns.
+-        reasoning_effort: Optional reasoning effort level ("max", "high", or None).
++        reasoning_effort: Reasoning effort level, one of "low", "high", "max".
++            None is treated as "low".
+
+     Returns:
+         Encoded string for this message.
+@@ -224,10 +234,13 @@ def render_message(index: int, messages: List[Dict[str, Any]], thinking_mode: st
+     if tool_calls:
+         tool_calls = tool_calls_from_openai_format(tool_calls)
+
+-    # Reasoning effort prefix (only at index 0 in thinking mode with max effort)
+-    assert reasoning_effort in ['max', None, 'high'], f"Invalid reasoning effort: {reasoning_effort}"
+-    if index == 0 and thinking_mode == "thinking" and reasoning_effort == 'max':
+-        prompt += REASONING_EFFORT_MAX
++    reasoning_effort = reasoning_effort or DEFAULT_REASONING_EFFORT
++    assert reasoning_effort in REASONING_EFFORT_PROMPTS, (
++        f"Invalid reasoning effort: {reasoning_effort}, expected one of "
++        f"{list(REASONING_EFFORT_PROMPTS)}"
++    )
++    if index == 0 and thinking_mode == "thinking":
++        prompt += REASONING_EFFORT_PROMPTS[reasoning_effort]
+
+     if role == "system":
+         prompt += system_msg_template.format(content=content or "")
+@@ -507,7 +520,8 @@ def encode_messages(
+         drop_thinking: If True, drop reasoning from earlier assistant turns
+                       (only keep reasoning for messages after the last user message).
+         add_default_bos_token: Whether to prepend BOS token at conversation start.
+-        reasoning_effort: Optional reasoning effort level ("max", "high", or None).
++        reasoning_effort: Reasoning effort level, one of "low", "high", "max".
++            Only takes effect in thinking mode. None is treated as "low".
+
+     Returns:
+         The encoded prompt string.
+--- a/vllm/parser/deepseek_v4.py
++++ b/vllm/parser/deepseek_v4.py
+@@ -219,10 +219,18 @@ def __init__(
+         **kwargs,
+     ) -> None:
+         chat_kwargs = kwargs.pop("chat_template_kwargs", None) or {}
+-        thinking = (
+-            bool(chat_kwargs.get("thinking") or chat_kwargs.get("enable_thinking"))
+-            and chat_kwargs.get("reasoning_effort") != "none"
+-        )
++        # Mirror the tokenizer's apply_chat_template default exactly: omitted
++        # thinking/enable_thinking means thinking mode (the 0731 contract).
++        # A parser default that disagrees with the template leaves the state
++        # machine in CONTENT while the model is inside an open <think> block,
++        # so reasoning streams out as content.
++        if "thinking" in chat_kwargs or "enable_thinking" in chat_kwargs:
++            thinking = bool(
++                chat_kwargs.get("thinking") or chat_kwargs.get("enable_thinking")
++            )
++        else:
++            thinking = True
++        thinking = thinking and chat_kwargs.get("reasoning_effort") != "none"
+         super().__init__(
+             tokenizer,
+             tools,
+--- a/vllm/v1/worker/gpu/sample/gumbel.py
++++ b/vllm/v1/worker/gpu/sample/gumbel.py
+@@ -207,7 +207,14 @@ def _gumbel_sample_kernel(
+         USE_FP64=USE_FP64,
+         PER_TOKEN_COL=PER_TOKEN_COL,
+     )
+-    token_id = block_idx * BLOCK_SIZE + idx
++    # `idx` is the argmax over a BLOCK_SIZE-wide tile whose out-of-vocab tail
++    # lanes are loaded as -inf. When every in-vocab lane of the tile is also
++    # -inf (or NaN) the reduction can settle on one of those tail lanes, giving
++    # token_id >= vocab_size. Nothing downstream bounds a sampled token id, and
++    # DeepSeek-V4's hash-MoE router indexes tid2eid[token_id * topk] directly,
++    # so such an id reads past the table and faults the context. Clamp: in that
++    # degenerate all--inf tile any index is equally arbitrary.
++    token_id = tl.minimum(block_idx * BLOCK_SIZE + idx, vocab_size - 1)
+     tl.store(local_argmax_ptr + token_idx * local_argmax_stride + block_idx, token_id)
+     tl.store(local_max_ptr + token_idx * local_max_stride + block_idx, value)
+
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
+@@ -240,7 +240,12 @@ def _compute_local_logits_stats_kernel(
+             other=float("-inf"),
+         ).to(tl.float32)
+         value, idx = tl.max(target_logits, axis=0, return_indices=True)
+-        token_id = block_idx * BLOCK_SIZE + idx
++        # Out-of-vocab tail lanes of this tile are loaded as -inf; when every
++        # in-vocab lane is also -inf/NaN the reduction can settle on one of
++        # them, yielding token_id >= vocab_size. Nothing downstream bounds a
++        # sampled token id. Clamp -- in that degenerate tile any index is
++        # equally arbitrary.
++        token_id = tl.minimum(block_idx * BLOCK_SIZE + idx, vocab_size - 1)
+         tl.store(
+             target_local_argmax_ptr
+             + logit_idx * target_local_argmax_stride
+@@ -789,7 +794,9 @@ def _resample_kernel(
+         APPLY_TEMPERATURE=False,
+         USE_FP64=USE_FP64,
+     )
+-    token_id = block_idx * BLOCK_SIZE + idx
++    # See the note in _compute_local_logits_stats_kernel: bound the tile-local
++    # argmax so an all--inf tile cannot produce an out-of-vocab token id.
++    token_id = tl.minimum(block_idx * BLOCK_SIZE + idx, vocab_size - 1)
+     tl.store(
+         resampled_local_argmax_ptr
+         + req_idx * resampled_local_argmax_stride
