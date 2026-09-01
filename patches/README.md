@@ -13,6 +13,16 @@ On `c3046d1`:
 - **Drop `0001`** — its `has_device_capability(90)` gate is now upstream.
 - **`0002 0003 0004 0005 0005a 0006` apply unchanged, zero rejects**, in glob order.
   (`0005a` must still precede `0006`; the glob order does that.)
+- **`0007` (new, 2026-08-20)** — NaN→`-inf` guard before `tl.argmax` in the rejection
+  sampler, `v1/worker/gpu/spec_decode/rejection_sampler_utils.py`. Port of
+  vllm-project/vllm@`47a4e410b` (upstream #50183, 2026-08-06), which post-dates this base.
+  Without it, an all-NaN target logits row makes `tl.argmax` return a padded-region index —
+  OOB read, arbitrary token committed. On sm8x + fp8 kv-cache this reproduces as DSML/tool-call
+  corruption under DSpark greedy speculation; see
+  [allover326/deepseek-v4-cmp170hx#9](https://github.com/allover326/deepseek-v4-cmp170hx/issues/9)
+  for the full investigation (35–65% corruption without the guard, 56/56 clean structured tool
+  calls including streaming with it, on 2× 8-GPU A800 TP=4+EP). Applies after `0006` in glob
+  order; touches a file no other patch modifies.
 - ⚠️ **The range touches `csrc/`** (`libtorch_stable/topk.cu` FilteredTopK decode routing —
   one of the real wins — plus `marlin.cu`, `custom_all_reduce.cuh`), so
   `VLLM_USE_PRECOMPILED=1` and the bind-mount method **cannot deliver the kernel changes**.
