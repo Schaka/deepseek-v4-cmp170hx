@@ -103,6 +103,57 @@ The branch's SM8x commit touches only Python and Triton — no `csrc/`, no CMake
 
 ---
 
+## Connecting an agent client
+
+Any OpenAI-compatible agent works against `http://<host>:8098/v1` — the config below is
+[opencode](https://opencode.ai) as a worked example; the same three things (base URL,
+`reasoning_effort` on every request, and knowing which field carries reasoning text) apply to
+any client.
+
+```json
+{
+    "provider": {
+        "dsv4": {
+            "npm": "@ai-sdk/openai-compatible",
+            "name": "vLLM dsv4",
+            "options": { "baseURL": "http://<host>:8098/v1" },
+            "models": {
+                "dsv4s": {
+                    "name": "dsv4-a100",
+                    "limit": { "context": 750000, "output": 32000 },
+                    "options": {
+                        "chat_template_kwargs": {
+                            "thinking": true,
+                            "reasoning_effort": "max"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+In opencode this goes in `opencode.json` under the model's `options.chat_template_kwargs` —
+**not** a system prompt. Three things worth knowing:
+
+- ★ **Set `reasoning_effort` explicitly on every request, not just the first.** A session that
+  never sends it can drift over many turns into a self-reinforcing repetition loop — see
+  [SETTINGS.md](SETTINGS.md#--reasoning-parser-deepseek_v4----set-it-even-if-you-never-enable-thinking)
+  for the live-testing evidence and the server-side tripwires (`0020`/`0021`) that catch one if
+  it still happens. Prefer `max` over `high` for agentic sessions specifically — a
+  [community-reported bug](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731/discussions/39)
+  has `low`/`high` sometimes rendering an empty thinking prefix that accumulates in history over
+  long sessions; `high` still wins on pure recall benchmarks if you don't need agentic tool use.
+- **Reasoning text arrives in a field called `reasoning`, not the more common `reasoning_content`
+  convention.** Patch `0023` makes this server also emit `reasoning_content` as a duplicate for
+  clients that only look for the latter — if you're on an older build without it, check which
+  field your client actually reads before assuming reasoning is being dropped.
+- `top_p` is pinned server-side (`--override-generation-config`) matching official 0731 agentic
+  guidance, so there's nothing to set client-side for that one.
+
+---
+
 ## Results at a glance
 
 | | plain | **+ DSpark** |
