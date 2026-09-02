@@ -132,9 +132,19 @@ only the latter sees zero thinking and cannot distinguish a thinking run from a 
 
 **Enabling thinking** (worth it — [+19 points of long-context recall](RESULTS.md#thinking-recovers-a-lot-of-the-lost-long-context-recall--the-effort-level-does-not)):
 per request via `"chat_template_kwargs": {"thinking": true, "reasoning_effort": "high"}`, or
-server-side with `--default-chat-template-kwargs`. **Use `high`, not `max`** — `max` thinks 2.7×
-harder for identical recall. A top-level `reasoning_effort` body param is the ambiguous path; it
-changes behaviour but `/tokenize` cannot see it.
+server-side with `--default-chat-template-kwargs`. For pure recall, `high` and `max` score
+identically and `max` costs 2.7× more compute — but for long agentic sessions, **`max` may be the
+better choice anyway**: a community thread on the model's own HF discussions
+([deepseek-ai/DeepSeek-V4-Flash-0731#39](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731/discussions/39))
+reports `reasoning_effort: "low"`/`"high"` can render an **empty** thinking prefix on some
+vLLM versions; those empty `<think></think>` blocks then accumulate in conversation history over
+a long session, and thinking rate was measured collapsing from 63% to 3% over ~100 turns —
+compounding into exactly the repetition-loop pattern `0020`/`0021` guard against. Switching to
+`{"thinking": true, "reasoning_effort": "max"}` resolved it for the reporter. Not yet verified on
+this fork's own build — worth testing before trusting over `high` here specifically, since our
+`0008` default-thinking fix may or may not share the same empty-prefix bug. A top-level
+`reasoning_effort` body param is the ambiguous path either way; it changes behaviour but
+`/tokenize` cannot see it.
 
 ★ **Set `reasoning_effort` explicitly on every request, not just the first one — agentic clients
 especially.** `0008` fixes the *default* (omitted now means thinking=True instead of silently
